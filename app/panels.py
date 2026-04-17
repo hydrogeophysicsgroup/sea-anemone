@@ -123,7 +123,7 @@ class dbdtSounding(Panel):
             # range_y=[self.settings.dbdt_min, self.settings.dbdt_max]
 
         )
-
+        
         fig2 = px.line(
             df_tmp,
             x=self.settings.x_axis,
@@ -553,11 +553,13 @@ class dbdtSection(Panel):
             line_id = int(float(x_axis.split(' ')[-1]))
             x_axis = f'_line_{line_id:0.0f}_x'
 
-        from __main__ import sesh
-        self.dataframe = sesh.data.copy()
-        self.dataframe = self.dataframe.loc[np.abs(self.dataframe[x_axis.replace('_x', '_y')])<self.settings.radius]
+            from __main__ import sesh
+            self.dataframe = sesh.data.copy()
+            self.dataframe = self.dataframe.loc[np.abs(self.dataframe[x_axis.replace('_x', '_y')])<self.settings.radius]
 
         new_df = self.dataframe[self.dataframe['site_id'].isin(site_ids)][x_axis].values
+        if len(new_df) == 0:
+            return None, None
         xmin, xmax = new_df.min(), new_df.max()
         dx = xmax-xmin
         xmax+= 0.1*dx
@@ -822,7 +824,65 @@ class dbdtSection(Panel):
         
         return fig  
 
+    def observed_by_gate_id(self):
+        y_axis                                             = self.settings.y_axis
+        x_axis = self.settings.x_axis
+        if x_axis.startswith('line'):
+            line_id = int(float(x_axis.split(' ')[-1]))
+            x_axis = f'_line_{line_id:0.0f}_x'
+
+        df_tmp = self.dataframe.copy()
+        df_tmp                                             = df_tmp.sort_values(['gate_id', x_axis])
+        df_tmp['include'] = df_tmp['inuse_manual'].astype(bool, copy=False).fillna(df_tmp['inuse_auto']).astype(bool)
+        # lm_factor = compute_lm_scaling(self.dataframe, self.settings.lm_factor)
+        lm_factor = self.settings.lm_factor
+        hm_factor = self.settings.hm_factor
+        df_tmp.loc[df_tmp['system_id'] == 0, 'dbdt']      *= lm_factor
+        df_tmp.loc[df_tmp['system_id'] == 1, 'dbdt']      *= hm_factor
+        df_tmp.loc[df_tmp['site_id'] ==  -1, 'include']  = False
+        df_tmp['system_id']                                = df_tmp['system_id'].map({0: 'lm', 1: 'hm'})
+
+        error_ub,error_lb = 'error_ub', 'error_lb'
+        if True:
+            error_ub = None
+            error_lb = None
+        
+        fig = px.scatter(
+            df_tmp,
+            x=x_axis,
+            y='gate_id',
+            color="log10_dbdt",
+            custom_data=["system_id", "data_id", "site_id"],
+        )
+        #fig.update
+
+        # df_tmp.loc[(~df_tmp['include']), 'dbdt'] = np.nan
+
+        
+        
+        # fig3 = px.scatter(
+        #     df_tmp,
+        #     x='gate_id',
+        #     y='dbdt',
+        #     color_discrete_sequence=["black", "black"],
+        #     color="system_id",
+        #     error_y=error_ub,
+        #     error_y_minus=error_lb,
+        # )
+
+        # fig2 = px.line(
+        #     df_tmp,
+        #     x='gate_id',
+        #     y='dbdt',
+        #     line_group="site_id",
+        #     color="system_id",
+        #     color_discrete_sequence=[self.settings.lm_color, self.settings.hm_color],
+        #     title="dbdt vs time by site_id",
+
+        return fig
+
     def render(self):
+        print("Rendering section")
         if self.dataframe is None: return self.empty_render()
         x_axis = self.settings.x_axis
         if x_axis.startswith('line'):
@@ -833,9 +893,14 @@ class dbdtSection(Panel):
             self.dataframe = self.dataframe.loc[np.abs(self.dataframe[x_axis.replace('_x', '_y')])<self.settings.radius]
             x_min = 0
             x_max = sesh.lines[sesh.lines.line==line_id].total_length.max()
+        # elif hasattr(self, 'xlim'):
+        #     x_min,x_max = self.xlim
         else:
             x_min = None
             x_max = None
+
+        if self.settings.y_axis=='gate_id':
+            return self.observed_by_gate_id()
 
         if 'dbdt_syn' in self.dataframe.columns:
             fig = self.compare_synthetic()
@@ -910,6 +975,8 @@ class dbdtSection(Panel):
         )
         if x_min is not None and x_max is not None:
             fig.update_xaxes(range=[x_min, x_max], autorange=False)
+        else:
+            fig.update_xaxes(autorange=False)
         return fig    
 
 @nosj

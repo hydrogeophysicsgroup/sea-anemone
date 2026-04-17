@@ -3,7 +3,7 @@ import plotly.io as pio
 from typing import Literal
 import plotly.express as px
 import plotly.graph_objects as go
-from dash import dash_table, ctx, no_update
+from dash import dash_table, ctx, no_update, Patch
 import numpy as np
 from nosj import nosj
 import utm
@@ -184,6 +184,100 @@ class Profile:
         return x,y
 
 
+class Grid:
+    def __init__(self, lat, lon, pixel_size=25., buffer_pixel=4):
+        self.lat = lat
+        self.lon = lon
+        utm_x, utm_y, zone, letter = utm.from_latlon(lat.mean(), lon.mean())
+        self.utm_x, self.utm_y, _, __ = utm.from_latlon(lat, lon, force_zone_number=zone, force_zone_letter=letter)
+        self.zone, self.letter = zone, letter
+        self.points_latlon = np.column_stack((self.lon, self.lat))
+        self.points_xy = np.column_stack((self.utm_x, self.utm_y))
+        self.pixel_size = pixel_size
+        self.buffer_pixel = buffer_pixel
+        self.calculate_grid()
+
+    def calculate_grid(self):
+        from scipy.spatial import cKDTree
+
+        kdtree = cKDTree(self.points_xy)
+        nn_dists, _ = kdtree.query(self.points_xy, k=2)
+        self.pixel_size = self.pixel_size
+
+        # 2. Compute bounding box with margin for 4 pixels
+        margin = self.buffer_pixel * self.pixel_size
+        xmin, ymin = self.points_xy.min(axis=0) - margin
+        xmax, ymax = self.points_xy.max(axis=0) + margin
+
+        # 3. Generate grid of pixel centers
+        nx = int(np.ceil((xmax - xmin) / self.pixel_size)) + 1
+        ny = int(np.ceil((ymax - ymin) / self.pixel_size)) + 1
+        x_centers = np.linspace(xmin, xmax, nx)
+        y_centers = np.linspace(ymin, ymax, ny)
+        xx, yy = np.meshgrid(x_centers, y_centers)
+        pixel_centers = np.column_stack([xx.ravel(), yy.ravel()])
+
+
+        dists, _ = kdtree.query(pixel_centers, k=1)
+        mask = dists <= margin
+        covered_pixels = pixel_centers[mask]
+        mesh_points = covered_pixels
+
+        coordinates_x = mesh_points[:, 0][:, None] + np.array([-1,  1, 1, -1, -1])[None,:]*self.pixel_size/2.
+        coordinates_y = mesh_points[:, 1][:, None] + np.array([-1, -1, 1,  1, -1])[None,:]*self.pixel_size/2.
+
+        clat, clon = utm.to_latlon(mesh_points[:, 0], mesh_points[:, 1], self.zone, self.letter)
+        self.mesh_points = np.column_stack([clon, clat])
+
+        coordinates_lat, coordinates_lon = utm.to_latlon(coordinates_x, coordinates_y, self.zone, self.letter)
+
+        tree = cKDTree(self.points_xy)
+        self.mesh_dists, self.mesh_idxs = tree.query(mesh_points, k=6)
+
+        features = []
+        ids = []
+
+        for i, (cx, cy) in enumerate(mesh_points):
+            coords = [(x,y) for x,y in zip(coordinates_lon[i], coordinates_lat[i])]
+            cell_id = str(i)
+            ids.append(cell_id)
+            features.append({
+                "type": "Feature",
+                "id": cell_id,
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [coords]
+                }
+            })
+        self.geojson = {"type": "FeatureCollection", "features": features}
+        self.ids = ids
+        print('n_pixels:', len(self.mesh_points))
+
+    def grid_values(self, z_data):
+        weight = 1./self.mesh_dists
+        weight /= weight.sum(axis=1, keepdims=True)
+        z_mesh = weight[:, 0] * z_data[self.mesh_idxs[:, 0]]
+        for i in range(1, self.mesh_idxs.shape[1]):
+            z_mesh += weight[:, i] * z_data[self.mesh_idxs[:, i]]
+        return z_mesh
+    
+    def graph_object(self, z_data, **kwargs):
+        z_mesh = self.grid_values(z_data)
+        opacity = kwargs.pop('opacity', 1)
+        return go.Choroplethmap(
+            geojson=self.geojson,
+            locations=self.ids,
+            z=z_mesh,
+            showlegend=True,
+            marker=dict(opacity=opacity, line=dict(width=0, color=None)),
+            showscale=True,
+            hoverinfo="skip",
+            selectedpoints=[],
+            unselected=dict(marker=dict(opacity=opacity)),            
+            **kwargs
+        )
+
+
 @nosj
 class MapSettings(PanelSettings):
     zoom: int = 10
@@ -195,6 +289,8 @@ class MapSettings(PanelSettings):
     view: dict = None
     markersize: int=14
     line_width: int=3
+    legend: bool = False
+    mean_res: int = 0
 
 
 class Map(Panel):
@@ -202,11 +298,15 @@ class Map(Panel):
     highlighted: int = None
     buffer_sites: list = None
     lines = None
+    
+
+    
 
     def __init__(self, data, **kwargs):
         settings = MapSettings(id='map', **kwargs)
         super().__init__(id='map', settings=settings)
         self.dataframe = data
+        self.layer_order=['tif', 'meanres', 'buffer', 'sites', 'highlight', 'lines']
 
     def render(self):
         if self.dataframe is None: return self.empty_render()
@@ -217,13 +317,15 @@ class Map(Panel):
         zoom = self.settings.view['map.zoom'] if self.settings.view is not None else self.settings.zoom
         center = self.settings.view['map.center'] if self.settings.view is not None else None
 
+        c_layers = []
+
         if self.settings.plot_by in self.dataframe.columns:
 
             fig = px.scatter_map(df_plot, lat="latitude", lon="longitude", zoom=zoom, center=center, 
                                  color=self.settings.plot_by, color_continuous_scale='turbo',
                                  custom_data='site_id'
                                  )
-            fig.update_traces(marker=dict(size=self.settings.markersize))
+            fig.update_traces(marker=dict(size=self.settings.markersize), name='sites')
             fig.update_layout(
                 coloraxis_colorbar=dict(
                     orientation="h", 
@@ -237,32 +339,32 @@ class Map(Panel):
                 text='',
                 side="bottom"))
             )
+            c_layers.append('sites')
         else:
             fig = px.scatter_map(df_plot, lat="latitude", lon="longitude", custom_data='site_id',
                                  zoom=zoom, center=center, color_discrete_sequence=[self.settings.color])
-            fig.update_traces(marker=dict(size=self.settings.markersize))
+            fig.update_traces(marker=dict(size=self.settings.markersize), name='sites')
+            c_layers.append('sites')
 
-        if self.buffer_sites is None:
+        if self.buffer_sites is not None:
             self.buffer_sites = self.dataframe['site_id'].unique().tolist()
             df_buffer = self.dataframe.copy()
         else:
             df_buffer = self.dataframe.copy()[self.dataframe["site_id"].isin(self.buffer_sites)]
-        buffer_trace = px.scatter_map(
-            df_buffer,
-            lat="latitude",
-            lon="longitude",
-            zoom=zoom, center=center, 
-        )
+            buffer_trace = px.scatter_map(
+                df_buffer,
+                lat="latitude",
+                lon="longitude",
+                zoom=zoom, center=center, 
+            )
+            c_layers.append('buffer')
+            buffer_trace.update_traces(
+                marker=dict(size=self.settings.markersize*1.5, color=self.settings.buffer_color),
+                name="Buffer window"
+            )
 
-        buffer_trace.update_traces(
-            marker=dict(size=self.settings.markersize*1.5, color=self.settings.buffer_color),
-            name="Buffer window"
-        )
-
-        for trace in buffer_trace.data:
-            fig.add_trace(trace)
-        
-        fig.data = fig.data[-1:]+fig.data[:-1]
+            for trace in buffer_trace.data:
+                fig.add_trace(trace)
 
         fig.update_layout(map_style="white-bg",
             map_layers=[
@@ -282,20 +384,57 @@ class Map(Panel):
         if self.lines is not None and self.settings.dragmode=='drawline':
             for line_id in self.lines.line.unique():
                 fig.add_shape(self.line2path(line_id))
-
         elif self.lines is not None:
             fig2 = px.line_map(self.lines, lat='latitude', lon='longitude', line_group='line', color='line', zoom=zoom, center=center, color_discrete_sequence=line_colors)
             fig2.update_traces(mode='lines', hovertemplate='Line%{line:.0f}', line=dict(width=self.settings.line_width))
             fig = go.Figure(data=fig.data+fig2.data, layout=fig.layout)
+            for i in range(len(fig2.data)):
+                c_layers.append(f'line_{i:02d}')
 
         hovermode = False if self.settings.dragmode=='drawline' else None
         fig.update_layout(margin={"r":0,"t":0,"l":0,"b":0},
                           modebar=dict(add=['drawline', 'eraseshape'], remove=['zoomIn', 'zoomOut', 'lasso', 'toImage', 'plotly-logomark']),
                           newshape=dict(line_color='black', line_width=3, line_dash='dash'),
-                          dragmode=self.settings.dragmode, showlegend=False, hovermode=hovermode)
+                          dragmode=self.settings.dragmode, hovermode=hovermode)
         
-        return fig 
+        if hasattr(self, 'grid') and self.grid is not None:
+            from __main__ import sesh
+            z_new = np.array([self.settings.mean_res, self.settings.mean_res+1])*10.
+            res_grid = np.log10(rediscretize(sesh.models, z_new))
+            # res_grid = 
+            fig.add_trace(self.grid.graph_object(res_grid, zmin=0, zmax=2, colorscale='Turbo', name='Mean Res'))
+            c_layers.append('meanres')
+        
+        data_list = list(fig.data)
+        reordered_data = []
+        reordered_labels = []
+        used_id = np.zeros(len(data_list), dtype=bool)
+        
+        for layer in self.layer_order:
+            if layer in c_layers: 
+                reordered_data.append(data_list[c_layers.index(layer)])
+                used_id[c_layers.index(layer)] = True
+                reordered_labels.append(layer)
+        for i,add in zip(np.arange(len(data_list)), ~used_id):
+            if add:
+                reordered_data.append(data_list[i])
+                reordered_labels.append(c_layers[i])
 
+        fig.data = reordered_data
+        self._layers = reordered_labels
+
+        if self.settings.legend:
+            fig.update_layout(showlegend=True,
+                legend=dict(x=0.01, y=0.99,
+                    xanchor="left",yanchor="top",
+                    bgcolor="rgba(255,255,255,0.5)",  # semi-transparent background
+                    bordercolor="black",borderwidth=1,
+                )
+            )
+
+        return fig
+    
+        
     def line2path(self, line_id):
         c_line = self.lines.loc[self.lines.line==line_id]
         path_dict = {'editable': True, 'type':'path', 'line': {'color': line_colors[int(line_id)%len(line_colors)-1], 'width': 3, 'dash': 'dash'}}
@@ -393,6 +532,20 @@ class Map(Panel):
                                 'width': '150px'
                             }
                         ),
+
+                        dbc.Input(
+                            type='number',
+                            step=1,
+                            value=0,
+                            id=self.id+'_mean_res',
+                            style={
+                                'position': 'absolute',
+                                'bottom': '10px',
+                                'left': '75%',
+                                'transform': 'translateX(-50%)',
+                                'width': '150px'
+                            }                            
+                        )
                     ],
                     style={
                         'flex': '1',
@@ -411,6 +564,9 @@ class Map(Panel):
             }
         )
 
+    def make_grid(self):
+        self.grid = Grid(self.dataframe.latitude.values, self.dataframe.longitude.values, pixel_size=25., buffer_pixel=4)
+
     def add_callbacks(self, app):
         super().add_callbacks(app)
 
@@ -425,6 +581,21 @@ class Map(Panel):
                 raise PreventUpdate
             self.settings.plot_by = value
             return self.render()  
+        
+        @app.callback(
+            self.output,
+            Input(self.id+'_mean_res', 'value'),
+            prevent_initial_call=True
+        )
+        def update_mean_res(value):
+            self.settings.mean_res = value
+            m1_patch = Patch()
+            from __main__ import sesh
+            z_new = np.array([self.settings.mean_res, self.settings.mean_res+1])*10.
+            res_grid = np.log10(rediscretize(sesh.models, z_new))
+
+            m1_patch['data'][self._layers.index('meanres')]['z'] = self.grid.grid_values(res_grid)
+            return m1_patch
 
         @app.callback(
             self.output,
@@ -507,3 +678,47 @@ class Map(Panel):
                     x_axis = 'line '+f'{line_id:0.0f}'
                     result = x_axis
             return result
+        
+
+def rediscretize_matrix(z_old, z_new):
+    """this function rediscretizes values onto a new grid. if an interval on the new discretization spans several layers, the resulting average will be thickness averaged."""
+    if type(z_old) is tuple:
+        z_old1,z_old2 = z_old
+    elif isinstance(z_old, np.ndarray):
+        z_old1 = np.insert(z_old, 0,0)[:-1]
+        z_old2 = z_old*1
+
+    if type(z_new) is tuple:
+        z_new1,z_new2 = z_new
+    elif isinstance(z_new, np.ndarray):
+        z_new1 = np.insert(z_new, 0,0)[:-1]
+        z_new2 = z_new*1
+
+    zo1,zn1 = np.meshgrid(z_old1, z_new1, indexing='ij')
+    zo2,zn2 = np.meshgrid(z_old2, z_new2, indexing='ij')
+
+    ov1 = np.max(np.stack([zo1,zn1]), axis=0)
+    ov2 = np.min(np.stack([zo2,zn2]), axis=0)
+    ov = ov2-ov1
+    ov[ov<0] = 0
+
+    if z_new2[-1] > z_old2[-1]:
+        ov[-1, -1] = 1.
+    
+    ov /= ov.sum(0, keepdims=True)
+    
+    return ov
+
+def rediscretize(model_df, z_new):
+    d_top = model_df['top_depth'].unique()
+    d_bot = model_df['bottom_depth'].unique()
+    res_grid = model_df.pivot_table('resistivity', 'site_id', 'center_depth').values
+    # print(res_grid.shape)
+    # model_df=model_df[model_df.site_id.isin(res_grid.index)]
+    z_old = np.unique(np.concatenate((d_top[1:],d_bot)))
+    z_old.sort()
+    redisc_mat = np.nan_to_num(rediscretize_matrix(z_old, z_new))
+
+    if len(z_new)==2:
+        redisc_mat = redisc_mat[:, 1:].squeeze()
+    return res_grid @ redisc_mat

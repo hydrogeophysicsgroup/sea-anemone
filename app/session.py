@@ -1,5 +1,5 @@
 from typing import List
-from pandas import DataFrame
+import pandas as pd
 import json_numpy
 from anemone.forwards import Forward
 import temframe
@@ -8,7 +8,6 @@ from basepanel import PanelSettings
 
 from numpy import nan as np_nan, array as np_array
 
-import pandas as pd
 def rounded_nanmean(x):
     return round(x.mean(), 2)
 
@@ -24,10 +23,10 @@ def clean_table(df):
 
 @nosj
 class Session:
-    data:   DataFrame = None
-    models: DataFrame = None
-    site:   DataFrame = None
-    lines:  DataFrame = None
+    data:   pd.DataFrame = None
+    models: pd.DataFrame = None
+    site:   pd.DataFrame = None
+    lines:  pd.DataFrame = None
     forwards: List[Forward] = None
     settings: SessionSettings = None
     save_dir: str = None
@@ -190,4 +189,404 @@ class Session:
                     self.data = self.data.merge(self.site[[x_axis, y_axis]], left_on='site_id', right_index=True, how='left')
                 if self.models is not None:
                     self.models = self.models.merge(self.site[[x_axis, y_axis]], left_on='site_id', right_index=True, how='left')
+    
+
+    @classmethod
+    def from_workbench(cls, fname):
+        import os
+        import numpy as np
+
+        base = fname
+        # derive base stem if a specific workbench file was given
+        for suffix in ('_dat.xyz', '_syn.xyz', '_inv.xyz'):
+            if fname.endswith(suffix):
+                base = fname[:-len(suffix)]
+                break
+
+        dat_path = base + '_dat.xyz'
+        syn_path = base + '_syn.xyz'
+        mod_path = base + '_inv.xyz'
+
+        def read_workbench_table(path):
+            import re
+            from io import StringIO
+
+            if not os.path.exists(path):
+                raise FileNotFoundError(path)
+
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.readlines()
+
+            header_idx = None
+            for i, line in enumerate(lines):
+                s = line.strip()
+                if not s:
+                    continue
+                if s.startswith('#'):
+                    continue
+                # prefer lines that contain likely column names
+                tokens = re.split(r'\t|\s+', s)
+                low = [t.lower() for t in tokens]
+                if any(k in low for k in ('site_id', 'dbdt', 'dbdt_syn', 'latitude', 'layer', 'resistivity')):
+                    header_idx = i
+                    break
+
+            if header_idx is None:
+                # fallback to first non-empty non-comment line
+                for i, line in enumerate(lines):
+                    if line.startswith('/ LINE_NO '):
+                        header_idx = i
+                        break
+                    # if line.strip() and not line.strip().startswith('#'):
+                    #     header_idx = i
+                    #     break
+
+            text = ''.join([x.replace('/ ', '') for x in lines[header_idx:]])
+
+            # try tab first, then whitespace
+            try:
+                df = pd.read_csv(StringIO(text), sep='\t')
+                if df.shape[1] <= 1:
+                    raise ValueError
+            except Exception:
+                df = pd.read_csv(StringIO(text), sep=r'\s+', engine='python')
+            
+            df['site_id'] = df.index
+
+            return df
+
+
+        def parse_gate_times(path):
+            gates = None
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                line = f.readline()
+                while not line.startswith('/GATE TIMES'):
+                    line = f.readline()
+                gates = [float(x) for x in f.readline()[1:].strip().split()]
+            if gates is None:
+                raise ValueError("Gate times not found in file")
+            return gates
+
+        def parse_epsg(path):
+            epsg = None
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                line = f.readline()
+                while 'epsg' not in line.lower():
+                    line = f.readline()
+                epsg = line.split(':')[1].strip()[:-1]
+            if epsg is None:
+                raise ValueError("EPSG not found in file")
+            return epsg
+
+        def epsg_to_utmzone(epsg):
+            if isinstance(epsg, int):
+                epsg = str(epsg)
+            if epsg.startswith("326"):
+                return int(epsg[3:]), 'N'
+            elif epsg.startswith("327"):
+                return int(epsg[3:]), 'S'
+            else:
+                raise ValueError("Invalid EPSG for UTM")
+
+        times = parse_gate_times(dat_path)
+        zone_number, zone_letter = epsg_to_utmzone(parse_epsg(dat_path))
+
+        df_dat = read_workbench_table(dat_path)
+        df_syn = read_workbench_table(syn_path)
+        df_mod = read_workbench_table(mod_path)
         
+            # convert placeholder 9999 to NaN and remove placeholder rows
+        for df in (df_dat, df_syn, df_mod):
+            try:
+                df.replace(9999, np_nan, inplace=True)
+            except Exception:
+                pass
+            # drop rows that are completely empty
+            try:
+                df.dropna(how='all', inplace=True)
+            except Exception:
+                pass
+            # if site_id exists, drop rows where it's missing (placeholder)
+            if 'site_id' in df.columns:
+                try:
+                    df.dropna(subset=['site_id'], inplace=True)
+                except Exception:
+                    pass
+
+        # merge synthetic dbdt into measured data
+        df1 = df_dat.copy()
+        df_syn = df_syn.copy()
+
+
+        # -------------------------
+        # LOWERCASE COLUMNS
+        # -------------------------
+        df1.columns = df1.columns.str.lower()
+        df_syn.columns = df_syn.columns.str.lower()
+
+        # -------------------------
+        # BUILD GATE MAPS
+        # -------------------------
+        gate_map = {f"data_{i+1}": times[i] for i in range(len(times))}
+        std_map = {f"datastd_{i+1}": times[i] for i in range(len(times))}
+
+        id_vars = ['site_id', 'x', 'y', 'date', 'time', 'elevation', 'segments']
+
+        # -------------------------
+        # RESHAPE OBSERVED DATA
+        # -------------------------
+        df_obs = df1.melt(
+            id_vars=id_vars,
+            value_vars=[c for c in df1.columns if c.startswith('data_') and not c.startswith('datastd')],
+            var_name='gate',
+            value_name='dbdt'
+        )
+        df_obs['time'] = df_obs['gate'].map(gate_map)
+
+        df_std = df1.melt(
+            id_vars=id_vars,
+            value_vars=[c for c in df1.columns if c.startswith('datastd_')],
+            var_name='gate',
+            value_name='error_raw'
+        )
+        df_std['time'] = df_std['gate'].map(std_map)
+
+        df_obs = df_obs.merge(
+            df_std[['site_id', 'time', 'error_raw']],
+            on=['site_id', 'time'],
+            how='left'
+        )
+
+        # -------------------------
+        # RESHAPE SYNTHETIC DATA
+        # -------------------------
+        df_syn_long = df_syn.melt(
+            id_vars=id_vars,
+            value_vars=[c for c in df_syn.columns if c.startswith('data_')],
+            var_name='gate',
+            value_name='dbdt_syn'
+        )
+        df_syn_long['time'] = df_syn_long['gate'].map(gate_map)
+
+        # -------------------------
+        # MERGE OBS + SYN
+        # -------------------------
+        df = df_obs.merge(
+            df_syn_long[['site_id', 'time', 'dbdt_syn']],
+            on=['site_id', 'time'],
+            how='left'
+        )
+
+        # -------------------------
+        # BUILD TARGET DF
+        # -------------------------
+        df_data = pd.DataFrame({
+            'site_id': df['site_id'],
+            'dbdt': df['dbdt'],
+            'time': df['time'],
+            'date': df['date'],
+            'utm_x': df['x'],
+            'utm_y': df['y'],
+            'elevation': df['elevation'],
+            'dbdt_syn': df['dbdt_syn'],
+        })
+
+        # system_id = numdata - 1
+        df_data['system_id'] = df['segments'] - 1
+
+        # error transformation
+        df_data['error'] = (df['error_raw'] - 1.0) * 100.0
+        del df['error_raw']
+
+        # -------------------------
+        # DERIVED COLUMNS
+        # -------------------------
+        df_data['error_lb'] = df_data['dbdt'] - df_data['dbdt'] / (1. + df_data['error'] / 100.)
+        df_data['error_ub'] = df_data['dbdt'] * (1. + df_data['error'] / 100.) - df_data['dbdt']
+
+        df_data['log10_dbdt'] = np.log10(df_data['dbdt'])
+
+        # gate_id per site
+        df_data['gate_id'] = df_data.groupby('site_id').cumcount()
+
+        df_data['sys_gate'] = df_data['system_id'] + df_data['gate_id'] / 100.
+        df_data['data_id'] = np.arange(len(df_data))
+
+        # misfit
+        df_data['misfit'] = df_data['dbdt'] - df_data['dbdt_syn']
+
+        # flags
+        df_data['inuse_auto'] = 1
+        df_data['inuse_manual'] = 1
+        df_data['include'] = 1
+        df_data['daytime'] = 1
+        df_data['zone_number'] = zone_number
+        df_data['zone_letter'] = zone_letter
+
+
+        df_data.replace(9999, np_nan, inplace=True)
+        df_data = df_data[~df_data['dbdt'].isna()]
+
+        # -------------------------
+        # FINAL COLUMN ORDER
+        # -------------------------
+        df_data = df_data[
+            ['site_id','dbdt','error','inuse_auto','inuse_manual','time',
+            'gate_id','system_id','date','utm_x','utm_y','elevation',
+            'daytime','error_lb','error_ub','log10_dbdt',
+            'sys_gate','data_id','dbdt_syn','misfit','include',
+            'zone_number','zone_letter']
+        ]
+
+        import utm
+        lat,lon = utm.to_latlon(df_data['utm_x'].values, df_data['utm_y'].values, zone_number, zone_letter)
+        df_data['latitude'] = lat
+        df_data['longitude'] = lon
+
+        df_data.sort_values(['site_id','system_id','gate_id'], inplace=True, kind='stable')
+        df_data.reset_index(drop=True, inplace=True)
+
+        df_data['misfit'] = (df_data['dbdt'] - df_data['dbdt_syn']).abs() / (df_data['dbdt'].abs() * df_data['error'] / 100.)
+        df_data['distance'] = np.sqrt((df_data['utm_x'] - df_data['utm_x'].mean())**2 + (df_data['utm_y'] - df_data['utm_y'].mean())**2)
+
+        # done
+        df_data.head()
+
+        system_time = []
+        for system_id, group in df_data.groupby('system_id'):
+            system_time.append(group['time'].unique())
+        forwards = [Forward.example(times=stime, log_scale=True, do_setup=False) for stime in system_time]
+        obj = cls()
+        obj.data = df_data.copy()
+        obj.forwards = forwards
+
+        df = df_mod.copy()
+        df.columns = df.columns.str.lower()
+
+        # -------------------------
+        # DETECT LAYERS DYNAMICALLY
+        # -------------------------
+        rho_cols = [c for c in df.columns if c.startswith('rho_') and not c.startswith('rho_std')]
+        top_cols = [c for c in df.columns if c.startswith('dep_top_')]
+        bot_cols = [c for c in df.columns if c.startswith('dep_bot_') and not c.startswith('dep_bot_std')]
+
+        # sort properly (important!)
+        rho_cols = sorted(rho_cols, key=lambda x: int(x.split('_')[-1]))
+        top_cols = sorted(top_cols, key=lambda x: int(x.split('_')[-1]))
+        bot_cols = sorted(bot_cols, key=lambda x: int(x.split('_')[-1]))
+
+        id_vars = ['site_id','x','y','date','time','elevation','doi_standard']
+
+        # -------------------------
+        # MELT RESISTIVITY
+        # -------------------------
+        df_rho = df.melt(
+            id_vars=id_vars,
+            value_vars=rho_cols,
+            var_name='layer',
+            value_name='resistivity'
+        )
+
+        # -------------------------
+        # MELT TOP DEPTH
+        # -------------------------
+        df_top = df.melt(
+            id_vars=id_vars,
+            value_vars=top_cols,
+            var_name='layer',
+            value_name='top_depth'
+        )
+
+        # -------------------------
+        # MELT BOTTOM DEPTH
+        # -------------------------
+        df_bot = df.melt(
+            id_vars=id_vars,
+            value_vars=bot_cols,
+            var_name='layer',
+            value_name='bottom_depth'
+        )
+
+        # -------------------------
+        # EXTRACT LAYER INDEX
+        # -------------------------
+        df_rho['layer'] = df_rho['layer'].str.extract('(\\d+)').astype(int) - 1
+        df_top['layer'] = df_top['layer'].str.extract('(\\d+)').astype(int) - 1
+        df_bot['layer'] = df_bot['layer'].str.extract('(\\d+)').astype(int) - 1
+
+        # -------------------------
+        # MERGE ALL
+        # -------------------------
+        df_long = df_rho.merge(
+            df_top[['site_id','layer','top_depth']],
+            on=['site_id','layer'],
+            how='left'
+        ).merge(
+            df_bot[['site_id','layer','bottom_depth']],
+            on=['site_id','layer'],
+            how='left'
+        )
+
+        # -------------------------
+        # BUILD TARGET
+        # -------------------------
+        df_data = pd.DataFrame({
+            'site_id': df_long['site_id'],
+            'date': df_long['date'],
+            'utm_x': df_long['x'],
+            'utm_y': df_long['y'],
+            'elevation': df_long['elevation'],
+            'doi': df_long['doi_standard'],
+            'layer': df_long['layer'],
+            'resistivity': df_long['resistivity'],
+            'top_depth': df_long['top_depth'],
+            'bottom_depth': df_long['bottom_depth'],
+        })
+
+        # -------------------------
+        # DERIVED
+        # -------------------------
+        df_data['center_depth'] = (df_data['top_depth'] + df_data['bottom_depth']) / 2.0
+
+        # placeholder misfit (no synthetic here unless you add it later)
+        df_data['misfit'] = np.nan
+
+        # flags / coords
+        df_data['daytime'] = 1
+
+        # UTM zone
+        df_data['zone_number'] = zone_number
+        df_data['zone_letter'] = zone_letter
+        
+        lat,lon = utm.to_latlon(df_data['utm_x'].values, df_data['utm_y'].values, zone_number, zone_letter)
+        df_data['latitude'] = lat
+        df_data['longitude'] = lon
+        # -------------------------
+        # OPTIONAL: LAT/LON (if needed)
+        # -------------------------
+        # (skipped for speed; can add utm.to_latlon vectorized if needed)
+
+        # -------------------------
+        # FINAL ORDER (matching your target)
+        # -------------------------
+        df_data = df_data[
+            ['site_id','daytime','date',
+            'utm_x','utm_y','elevation','doi',
+            'layer','resistivity','misfit',
+            'top_depth','bottom_depth','center_depth', 'latitude','longitude']
+        ]
+
+        df_data.head()    
+
+
+        obj.models = df_data.copy()
+        obj.models['site_id'] = obj.models['site_id'].astype(float)
+        obj.save_dir = os.path.dirname(base) + os.sep if os.path.dirname(base) else ''
+
+        # try to populate site table and lines
+        try:
+            obj.update_site_table()
+        except Exception:
+            pass
+
+        return obj

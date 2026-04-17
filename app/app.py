@@ -7,7 +7,7 @@ if fpath not in sys.path:
 
 import session
 global sesh
-sesh = None
+sesh = None#session.Session.from_workbench(r"C:\\Users\\au646858\\OneDrive - Aarhus universitet\\Documents\\_repositories\\sea-anemone\\app\\Models\\Surround_MOD_dat.xyz")
 
 if sesh is None:
     sesh = session.Session()
@@ -132,18 +132,19 @@ for panel in panels:
     prevent_initial_call=True
 )
 def handle_map_interactions(selected_data):
-    # print(selected_data)
+    print("Map interaction detected")
     if not selected_data:
         raise PreventUpdate
         
     if 'points' in selected_data:
-        selected_sites = [point['pointNumber'] for point in selected_data['points'] if point['curveNumber']==1]
+        curve_number = m1._layers.index('sites')
+        selected_sites = [point['pointNumber'] for point in selected_data['points'] if point['curveNumber']==curve_number]
 
 
     if selected_sites:
         selected_sites = list(set(selected_sites))
     else:
-        PreventUpdate
+        raise PreventUpdate
     
 
 
@@ -162,6 +163,7 @@ def handle_map_interactions(selected_data):
 
 
     xmin,xmax = dbdt2.xlim(selected_sites)
+    print(xmin, xmax)
 
     dbdt1_patch = dbdt1.render()
     dbdt2_patch = Patch()
@@ -180,6 +182,7 @@ def handle_map_interactions(selected_data):
     
     mod2_patch["layout"]["xaxis"]["range"]  = [xmin, xmax]
     dbdt2_patch["layout"]["xaxis"]["range"] = [xmin, xmax]
+    # dbdt2.xlim = [xmin, xmax]
     
     data_buffer = {"length": len(selected_sites), "start_site": min(selected_sites)}
     return dbdt1_patch, dbdt2_patch, rhoa_patch, mod1_patch, mod2_patch, m1_patch, data_buffer, len(selected_sites)
@@ -229,59 +232,76 @@ def show_value(n1, n2, ttem_selected, sounding_selected, rhoa_selected, interpre
     return dbdt1.render(), dbdt2.render(), rhoa.render()
 
 @app.callback(
-    mod2.output, dbdt2.output, dbdt1.output, m1.output, mod1.output, rhoa.output,
-    Input('data-buffer', 'data'),
-    prevent_initial_call=True
+    dbdt1.output, rhoa.output,
+    Input(dbdt2.id, 'selectedData'),
+    prevent_initial_call=True,
 )
-def update_model_section_from_buffer(buffer_data):
-    start  = buffer_data["start_site"]
-    length = buffer_data["length"]
+def update_selection_from_section(selected_data):
+    print(selected_data)
+    if not selected_data or 'points' not in selected_data:
+        raise PreventUpdate
 
-    # Update model section buffer
-    mod2.buffer_start = start
-    mod2.buffer_len   = length
-    mod1.buffer_start = start
-    mod1.buffer_len   = length
+    site_ids = [point['customdata'][2] for point in selected_data['points'] if 'customdata' in point]
+
+    df_data = sesh.data
+    dbdt1.dataframe = df_data[df_data['site_id'].isin(site_ids)]
+    rhoa.dataframe  = df_data[df_data['site_id'].isin(site_ids)]
+    return dbdt1.render(), rhoa.render()
+
+# @app.callback(
+#     mod2.output, dbdt2.output, dbdt1.output, m1.output, mod1.output, rhoa.output,
+#     Input('data-buffer', 'data'),
+#     prevent_initial_call=True
+# )
+# def update_model_section_from_buffer(buffer_data):
+#     start  = buffer_data["start_site"]
+#     length = buffer_data["length"]
+
+#     # Update model section buffer
+#     mod2.buffer_start = start
+#     mod2.buffer_len   = length
+#     mod1.buffer_start = start
+#     mod1.buffer_len   = length
     
 
-    # Update tTEM buffer
-    dbdt2.buffer_start = start
-    dbdt2.buffer_len   = length
+#     # Update tTEM buffer
+#     dbdt2.buffer_start = start
+#     dbdt2.buffer_len   = length
 
 
-    x_axis = dbdt2.settings.x_axis
-    df = dbdt2.dataframe
+#     x_axis = dbdt2.settings.x_axis
+#     df = dbdt2.dataframe
 
-    df_buf = dbdt2.dataframe.copy()
-    if x_axis == "site_id":
-        df_buf = df_buf[df_buf["site_id"] != -1]
-    x_vals = np.sort(df_buf[x_axis].dropna().unique())
+#     df_buf = dbdt2.dataframe.copy()
+#     if x_axis == "site_id":
+#         df_buf = df_buf[df_buf["site_id"] != -1]
+#     x_vals = np.sort(df_buf[x_axis].dropna().unique())
 
-    x_slice = x_vals[start:start+length]
+#     x_slice = x_vals[start:start+length]
 
-    buffer_sites = (
-            df[
-                (df[x_axis].isin(x_slice)) &
-                (df["site_id"] != -1)
-            ]["site_id"]
-            .dropna()
-            .unique()
-        )
+#     buffer_sites = (
+#             df[
+#                 (df[x_axis].isin(x_slice)) &
+#                 (df["site_id"] != -1)
+#             ]["site_id"]
+#             .dropna()
+#             .unique()
+#         )
 
 
-    if buffer_data.get("source") == "buffer_button":
-        dbdt1.dataframe = sesh.data[sesh.data["site_id"].isin(buffer_sites)]
-        rhoa.dataframe  = sesh.data[sesh.data["site_id"].isin(buffer_sites)]
-    m1.buffer_sites = buffer_sites
-    m1.is_last_tab = False
-    # rhoa.dataframe = sesh.data[sesh.data["site_id"].isin(buffer_sites)]
-    # dbdt1.buffer_sites = buffer_sites
-    if buffer_data.get("source") == "buffer_button":
-        mod1.highlighted = None
-        mod2.highlighted = None
-        m1.highlighted = None
-        dbdt2.highlighted = None
-    return mod2.render(), dbdt2.render(), dbdt1.render(), m1.render(), mod1.render(), rhoa.render()
+#     if buffer_data.get("source") == "buffer_button":
+#         dbdt1.dataframe = sesh.data[sesh.data["site_id"].isin(buffer_sites)]
+#         rhoa.dataframe  = sesh.data[sesh.data["site_id"].isin(buffer_sites)]
+#     m1.buffer_sites = buffer_sites
+#     m1.is_last_tab = False
+#     # rhoa.dataframe = sesh.data[sesh.data["site_id"].isin(buffer_sites)]
+#     # dbdt1.buffer_sites = buffer_sites
+#     if buffer_data.get("source") == "buffer_button":
+#         mod1.highlighted = None
+#         mod2.highlighted = None
+#         m1.highlighted = None
+#         dbdt2.highlighted = None
+#     return mod2.render(), dbdt2.render(), dbdt1.render(), m1.render(), mod1.render(), rhoa.render()
 
 # @app.callback(
 #     Output('data-buffer', 'data'),
@@ -620,6 +640,7 @@ def upload_file(contents):
     sesh.models          = None
     m1.dataframe    = sesh.overview.copy()
     
+    
     buffer_length = 50
     # unique_sites = np.sort(sesh.data['site_id'].unique())
     # unique_sites = np.sort(sesh.data.loc[sesh.data['site_id'] != -1, 'site_id'].unique())
@@ -737,6 +758,9 @@ def update_layout(model,
         return layouts.review, *colors.values()
 
     elif button_id == "interpret_layout":
+        m1.make_grid()
+        m1.settings.legend=True
+        m1.settings.dragmode='pan'
         return layouts.interpret, *colors.values()
 
 
