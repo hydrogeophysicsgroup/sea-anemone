@@ -32,6 +32,12 @@ class Session:
     settings: SessionSettings = None
     save_dir: str = None
 
+    boreholes : DataFrame = None
+    rock_map : DataFrame = None
+    panel_ids: DataFrame = None
+    dem_path: str = None
+    dem_name: str = None
+
     def __post_init__(self):
         self._dmfwr = None
     
@@ -70,6 +76,14 @@ class Session:
         if other.lines is not None:
             other.lines.to_csv(folder+'lines.csv', index=False)
             other.lines = 'lines.csv'
+    
+        if other.boreholes is not None:
+            other.boreholes.to_csv(folder+'boreholes.csv', index=False)
+            other.boreholes = 'boreholes.csv'
+
+        if other.rock_map is not None:
+            other.rock_map.to_csv(folder+'rock_map.csv', index=False)
+            other.rock_map = 'rock_map.csv'
 
         if other.forwards is not None:
             for i in range(len(other.forwards)):
