@@ -313,6 +313,8 @@ class Panel:
             self.settings.add_callbacks(app)
             def update_render(*args):
                 for key, arg in zip(self.settings.flat_keys, args):
+                    if arg is None:
+                        continue
                     if isinstance(arg, dict) and 'hex' in arg:
                         arg = arg['hex']
                     

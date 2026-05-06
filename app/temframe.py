@@ -520,6 +520,10 @@ def invert(temdf, dmfwr, res_start, vc=0.5, hc=0.8, max_iterations=50):
     df_data['misfit'] = (((df_data['dbdt'] - df_data['dbdt_syn'])**2/(np.log1p(df_data['dbdt'].values*df_data['error'].values/100.)**2))**0.5)
 
     df_overview = overview(df_data)
+    
+    print(len(inv.doi), len(df_overview))
+    doi = doi[::2] # the df_overview was getting double the amount of DOI values so now we take only the first for each entry
+
     df_overview['doi'] = doi
     df_resmod = pd.DataFrame(results)
 

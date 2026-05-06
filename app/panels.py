@@ -207,8 +207,8 @@ class dbdtSounding(Panel):
             x=self.settings.x_axis,
             y='dbdt',
             color="system_id",
+            line_group="site_id",
             color_discrete_sequence=[self.settings.lm_color, self.settings.hm_color],
-            # title="dbdt vs time by site_id",
             custom_data=["system_id", "data_id", "site_id"],
             range_y=[self.settings.dbdt_min, self.settings.dbdt_max]
         )
@@ -218,8 +218,6 @@ class dbdtSounding(Panel):
 
         for trace in fig3.data:
             fig.add_trace(trace)
-
-
 
         return fig     
 
@@ -683,6 +681,7 @@ class dbdtSection(Panel):
 
         dx = xmax - xmin
         fig.update_xaxes(range=[xmin-0.01*dx, xmax+0.01*dx])
+        
         return fig    
 
     def observed_only(self):
@@ -993,7 +992,7 @@ class Upload(Panel):
         super().__init__(id='upload', settings=settings)
         for key, value in kwargs.items():
             setattr(self, key, value)
-
+            
     def render(self):
         return html.Div(
             [

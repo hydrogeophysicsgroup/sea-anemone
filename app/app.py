@@ -79,6 +79,16 @@ app.layout = html.Div([
     dcc.Store(id="starting-model", data={"rho": 10.0,"depth": np.cumsum(np.logspace(0, 1.3, 31)).tolist()}),
     dcc.Store(id='starting-model-selected',data=[]),
     dcc.Store(id='data-buffer',data={"length": 50, "start_site":0}),
+    
+    dcc.Store(id="dem-applied", data=False),
+    dcc.Store(id="dem-downloaded", data=False),
+
+    dcc.Store(id="selected_ids_store", data=[]),
+    dcc.Store(id="selected_sites_store", data=[]),
+    dcc.Store(id="selected_sites_local", data=[]),
+
+    dcc.Store(id="borehole-loaded", data=False),
+
     html.Div([dbc.Toast(
                     "⛔ Please Zoom or Pan in the map.",
                     id="zoom-toast",
@@ -118,9 +128,6 @@ app.layout = html.Div([
 
 for panel in panels:
     panel.add_callbacks(app)
-
-
-
 
 @app.callback(
     [ 
@@ -193,60 +200,165 @@ app.clientside_callback(
     Input("disableButton", "id")
 )
 
-@app.callback(
+@app.callback(m1.output,
     dbdt1.output, dbdt2.output, rhoa.output,
+
+    Output("selected_ids_store", "data"),
+    Output("selected_sites_store", "data"),
+    Output("selected_sites_local", "data"),
+
     Input("disableButton", "n_clicks"),
     Input("enableButton", "n_clicks"),
-    State("tTEM", "selectedData"),
-    State("sounding", "selectedData"),
-    State("rhoa", "selectedData"),
-    State('interpret_layout','color'),
+    Input("tTEM", "selectedData"),    
+    Input("sounding", "selectedData"), 
+    Input("rhoa", "selectedData"),     
+    
+    State("selected_ids_store", "data"),
+    State("selected_sites_store", "data"),
+    State("selected_sites_local", "data"),
+    State('interpret_layout', 'color'),
     prevent_initial_call=True,
 )
-def show_value(n1, n2, ttem_selected, sounding_selected, rhoa_selected, interpret_layout_color):
-    if interpret_layout_color == 'primary':
+def unified_handler(n1, n2, 
+                    ttem_sel, sounding_sel, rhoa_sel, 
+                    stored_data_ids, stored_site_ids, stored_site_ids_local,
+                    layout_color):
+    
+    if layout_color == 'primary':
         raise PreventUpdate
-    if str(ctx.triggered_id) == 'disableButton':
-        inuse = False
-    elif str(ctx.triggered_id) == 'enableButton':
-        inuse = True
 
+    trigger = str(ctx.triggered_id)
+    prop_id = ctx.triggered[0]["prop_id"]
+    df_data = sesh.data
+    
+    active_site_ids_local = stored_site_ids_local or []
+    active_data_ids = stored_data_ids or []
 
-    if ttem_selected and len(ttem_selected['points'])>0:
-        data_ids = [point['customdata'][1] for point in ttem_selected['points'] if 'customdata' in point]
-    elif sounding_selected and len(sounding_selected['points'])>0:
-        data_ids = [point['customdata'][1] for point in sounding_selected['points'] if 'customdata' in point]
-    elif rhoa_selected and len(rhoa_selected['points'])>0:
-        data_ids = [point['customdata'][1] for point in rhoa_selected['points'] if 'customdata' in point]        
+    if stored_site_ids:
+        active_site_ids = stored_site_ids
     else:
-        raise PreventUpdate
+        active_site_ids = df_data["site_id"].unique().tolist()
     
+    # --- 1. SITE FILTERING ---
+    # Determine which sites to display in the decay plots
+    if trigger == "tTEM" and ttem_sel and ttem_sel.get('points'):
+        active_site_ids = list(set(p['customdata'][2] for p in ttem_sel['points'] if 'customdata' in p))
+        active_data_ids = list(set( int(p["customdata"][1]) for p in ttem_sel["points"] if "customdata" in p))
 
-    df_data = sesh.data
+        map_site_ids = active_site_ids.copy()
+        active_site_ids_local = []
+
+    else:
+        # Keep the sites that are currently loaded in the plots
+        active_site_ids = stored_site_ids or dbdt1.dataframe['site_id'].unique().tolist()
+        map_site_ids = active_site_ids.copy()
+
+    if trigger in ["sounding", "rhoa"]:
+            sel = sounding_sel if trigger == "sounding" else rhoa_sel
+            if sel and sel.get("points"):
+                active_data_ids = list(set( int(p["customdata"][1]) for p in sel["points"] if "customdata" in p))
+                active_site_ids_local = list(set(df_data.loc[df_data["data_id"].isin(active_data_ids),"site_id"].tolist()))
+                map_site_ids =  active_site_ids_local.copy()
     
-    df_data.loc[df_data['data_id'].isin(data_ids), 'inuse_manual'] = inuse
-    df_data['include'] = df_data['inuse_manual'].astype(bool, copy=True).fillna(df_data['inuse_auto'])
-    dbdt1.dataframe = df_data[df_data['site_id'].isin(dbdt1.dataframe['site_id'].unique())]
-    dbdt2.dataframe = df_data[df_data['site_id'].isin(dbdt2.dataframe['site_id'].unique())]
-    rhoa.dataframe  = df_data[df_data['site_id'].isin(rhoa.dataframe['site_id'].unique())]
-    return dbdt1.render(), dbdt2.render(), rhoa.render()
+    # 4. Button logic
+    if trigger in ["disableButton", "enableButton"]:
 
-@app.callback(
-    dbdt1.output, rhoa.output,
-    Input(dbdt2.id, 'selectedData'),
-    prevent_initial_call=True,
-)
-def update_selection_from_section(selected_data):
-    print(selected_data)
-    if not selected_data or 'points' not in selected_data:
-        raise PreventUpdate
+        if active_data_ids:
+            inuse = (trigger == "enableButton")
+            df_data.loc[df_data["data_id"].isin(active_data_ids),"inuse_manual"] = inuse
+            df_data["include"] = (df_data["inuse_manual"].fillna(df_data["inuse_auto"]).astype(bool))
+            sesh.data = df_data
+            
+            active_site_ids_local = []
+            active_data_ids = []
+            map_site_ids = []
+    
+    # Double-click clear selections
+    if ".relayoutData" in prop_id:
+        relayout = ctx.triggered[0]["value"]
 
-    site_ids = [point['customdata'][2] for point in selected_data['points'] if 'customdata' in point]
+        if relayout and ( "autosize" in relayout or "xaxis.autorange" in relayout or "yaxis.autorange" in relayout):
 
-    df_data = sesh.data
-    dbdt1.dataframe = df_data[df_data['site_id'].isin(site_ids)]
-    rhoa.dataframe  = df_data[df_data['site_id'].isin(site_ids)]
-    return dbdt1.render(), rhoa.render()
+            map_site_ids = []
+            active_data_ids = []
+            active_site_ids_local = []
+
+    elif ".selectedData" in prop_id:
+        sel = ctx.triggered[0]["value"]
+
+        if sel is None:
+            map_site_ids = []
+            active_data_ids = []
+            active_site_ids_local = []
+
+    # 5. Apply site filtering
+    dbdt1.dataframe = df_data[df_data["site_id"].isin(active_site_ids)]
+    rhoa.dataframe = df_data[df_data["site_id"].isin(active_site_ids)]
+
+    # keep full tTEM for re-selection
+    dbdt2.dataframe = df_data
+    
+    if len(active_site_ids_local) != 0:
+        if len(active_site_ids_local) < len(active_site_ids) or len(active_site_ids_local) == len(active_site_ids):
+            m1.highlighted = active_site_ids_local.copy()
+    else:
+        m1.highlighted = map_site_ids
+    
+    highlight_clr = "#ffb835" #
+    m1.settings.highlight_color = highlight_clr
+    m1.settings.markersize = 8 # 14
+
+    # 6. Render
+    fig0 = m1.render()
+    fig1 = dbdt1.render()
+    fig2 = dbdt2.render()
+    fig3 = rhoa.render()
+
+    # preserve selection visuals
+    for fig in [fig0, fig1, fig2, fig3]:
+        if fig is not None:
+            fig.update_layout(uirevision="constant",dragmode="select")
+
+    # 7. Highlight selected points
+    for fig, f_id in zip([fig1, fig2, fig3],["sounding", "tTEM", "rhoa"]):
+        if not fig:
+            continue
+
+        # do not dim tTEM when it is source of site filter
+        # if trigger == "tTEM" and f_id == "tTEM":
+        #     for trace in fig.data:
+        #         trace.selectedpoints = None
+        #         trace.selected = {"marker": {"color": highlight_clr ,"opacity": 0.5,"size": 12}}
+        #     continue
+
+        for trace in fig.data:
+            if getattr(trace, "mode", "") == "lines":
+                continue
+
+            cd = getattr(trace, "customdata", None)
+            if cd is None:
+                continue
+
+            indices = [i for i, row in enumerate(cd)if int(row[1]) in active_data_ids]
+
+            if indices:
+                trace.selectedpoints = indices
+                if trigger == "tTEM" and f_id == "tTEM":                  
+                    trace.selected = {"marker": {"color": highlight_clr ,"opacity": 1,"size": 9}}
+                    trace.unselected = {"marker": {"opacity": 0.1}}
+                else:
+                    trace.selected = {"marker": {"color": highlight_clr ,"opacity": 0.8,"size": 10}}
+                    trace.unselected = {"marker": {"opacity": 0.1}}
+            elif active_data_ids:
+                trace.selectedpoints = []
+                trace.unselected = {"marker": {"opacity": 0.1}}
+
+            else:
+                trace.selectedpoints = None
+                trace.unselected = {"marker": {"opacity": 1}}
+
+    return (fig0, fig1, fig2, fig3, active_data_ids, active_site_ids, active_site_ids_local)
+
 
 # @app.callback(
 #     mod2.output, dbdt2.output, dbdt1.output, m1.output, mod1.output, rhoa.output,
@@ -599,23 +711,94 @@ def update_starting_model_from_single_drag(relayout, model):
 def reset_polling(n):
     return 0
 
+
+# ── Borehole upload callback ───────────────────────────────────────────────────
+@app.callback(
+    Output('output-borehole-upload', 'children'),
+    Output('borehole-loaded', 'data'),
+    m1.output,
+    Output('upload-toast', 'is_open', allow_duplicate=True),
+    Output('upload-toast', 'children', allow_duplicate=True),
+    Input('upload-borehole', 'contents'),
+    State('upload-borehole', 'filename'),
+    running=[(Output('upload-borehole', 'disabled'), True, False)],
+    prevent_initial_call=True
+)
+def upload_borehole(contents, filename):
+    import base64
+    from Sections_plotting import load_borehole_file, get_borehole_projections, boreholes_to_dataframe
+    if contents is None:
+        raise PreventUpdate
+
+    content_type, content_string = contents.split(',', 1)
+    decoded = base64.b64decode(content_string)
+    text = decoded.decode('utf-8', errors='replace')
+
+    try:
+        bh_data, rock_color_map = load_borehole_file(text, from_string=True)
+    except Exception as e:
+        return html.Div(f"Error parsing borehole file: {e}"), False, no_update, True, f"Borehole upload failed: {e}"
+
+    if not bh_data:
+        return html.Div("No boreholes found in file."), False, no_update, True, "No boreholes found."
+
+    boreholes = get_borehole_projections(bh_data)
+    sesh.borehole_list = boreholes
+    sesh.rock_map = rock_color_map
+    sesh.boreholes = boreholes_to_dataframe(bh_data)
+   
+    m1.boreholes = boreholes
+
+
+    m1.rock_color_map = rock_color_map
+    mod2.boreholes = boreholes
+    mod2.rock_color_map = rock_color_map
+    mod1.boreholes = boreholes
+    mod1.rock_color_map = rock_color_map
+
+    n_bh = len(bh_data)
+    bh_ids = ', '.join(b['id'] for b in bh_data)
+    return html.Div(f"Loaded {n_bh} borehole(s): {bh_ids}"), True, m1.render(), True, f"Loaded {n_bh} borehole(s)"
+
+# ── Toggle borehole upload visibility ─────────────────────────────────────────
+@app.callback(
+    Output('borehole-upload-container', 'style'),
+    m1.output,
+    Input('use-borehole', 'value'),
+    prevent_initial_call=True
+)
+def toggle_borehole_upload(use_borehole):
+    if use_borehole:
+        return {'display': 'block', 'marginTop': '10px'}, no_update
+    m1.boreholes = None;        m1.rock_color_map = None
+    mod2.boreholes = None;      mod2.rock_color_map = None
+    mod1.boreholes = None;      mod1.rock_color_map = None
+    return {'display': 'none', 'marginTop': '10px'}, m1.render()
+
 @app.callback(
     [Output('output-data-upload', 'children'),
 
      m1.output, dbdt1.output, dbdt2.output, rhoa.output, 
      Multi_inv.output, Sing_inv.output,
 
-     Output('output-data-summary', 'children', allow_duplicate=True),
      Output('upload-toast', 'is_open'),
      Output('upload-toast', 'children'),
      Output('process_layout', 'disabled', allow_duplicate=True),
      Output('invert_layout', 'disabled', allow_duplicate=True),
+     Output('process_layout', 'n_clicks', allow_duplicate=True),
+     Output('dem-bbox-minlon', 'value', allow_duplicate=True),
+     Output('dem-bbox-minlat', 'value', allow_duplicate=True),
+     Output('dem-bbox-maxlon', 'value', allow_duplicate=True),
+     Output('dem-bbox-maxlat', 'value', allow_duplicate=True),
+     Output('dem-options-container', 'style', allow_duplicate=True),
+     Output('borehole-options-container', 'style', allow_duplicate=True),
     ],
     Input('upload-data', 'contents'),
     running=[(Output("upload-data", "disabled"), True, False)],
     prevent_initial_call=True
 )
 def upload_file(contents):
+    print("file upload here")
     global sesh
     if contents is None:
         raise PreventUpdate
@@ -632,7 +815,6 @@ def upload_file(contents):
     if contents[0].startswith('data:application/x-zip'):
         # try:
         sesh.data, sesh.forwards = temframe.from_zip_content(contents[0])
-
         # except Exception as e:
         #     return (html.Div("Upload failed."),no_update,no_update,no_update,no_update,no_update,no_update,build_data_summary(),True,f"Upload failed: Only one geometry is supported at a time",True,True,no_update,no_update,no_update,no_update,no_update,{'display': 'block'}, {'display': 'block'})
     # sesh.site = sesh.overview
@@ -675,8 +857,18 @@ def upload_file(contents):
     upload_msg = "File uploaded successfully."
     if warning_msg:
         upload_msg = f"{upload_msg} {warning_msg}"
-
-    return html.Div(upload_msg), m1.render(), dbdt1.render(), dbdt2.render(), rhoa.render(), Multi_inv.render(), Sing_inv.render(), 'data uploaded', True, toast_msg, False, False
+    
+    bbox_vals = (no_update, no_update, no_update, no_update)
+    if 'longitude' in sesh.data.columns and 'latitude' in sesh.data.columns:
+        min_lon = float(sesh.data['longitude'].min())
+        max_lon = float(sesh.data['longitude'].max())
+        min_lat = float(sesh.data['latitude'].min())
+        max_lat = float(sesh.data['latitude'].max())
+        pad = 0.01
+        bbox_vals = (min_lon - pad, min_lat - pad, max_lon + pad, max_lat + pad)
+    
+    # return html.Div(upload_msg), m1.render(), dbdt1.render(), dbdt2.render(), rhoa.render(), Multi_inv.render(), Sing_inv.render(), 'data uploaded', True, toast_msg, False, False
+    return html.Div(upload_msg), m1.render(), dbdt1.render(), dbdt2.render(), rhoa.render(), Multi_inv.render(), Sing_inv.render(), True, toast_msg, False, False, no_update, *bbox_vals, {'display': 'block'}, {'display': 'block'}
 
 
 # @app.callback(
@@ -688,6 +880,8 @@ def upload_file(contents):
 # def print_flex_layout_model(model):
 #     print(f"Flex layout model: {model}")
 #     return m1.render()
+
+
 @app.callback(
     Output({'type': f'settings-{dbdt2.id}', 'key': 'x_axis'}, 'value'),
     Input({'type': f'settings-{mod2.id}', 'key': 'x_axis'}, 'value'),
@@ -704,6 +898,14 @@ def sync_x_axis(x_axis):
 def sync_radius(radius):
     return radius
 
+
+@app.callback(
+    Output({'type': f'settings-{dbdt2.id}', 'key': 'Borehole_radius'}, 'value'),
+    Input({'type': f'settings-{mod2.id}', 'key': 'Borehole_radius'}, 'value'),
+    prevent_initial_call=True
+)
+def sync_radius(bh_radius):
+    return bh_radius
 
 
 @app.callback(
@@ -746,26 +948,25 @@ def update_layout(model,
     colors[button_id] = 'primary'
 
     if button_id == "upload_layout":
-        return layouts.upload, *colors.values()
+        return layouts.upload, *colors.values(), 
 
     elif button_id == "process_layout":
-        return layouts.data, *colors.values()
+        return layouts.data, *colors.values(), 
 
     elif button_id == "invert_layout":
-        return layouts.invert, *colors.values()
+        return layouts.invert, *colors.values(), 
 
     elif button_id == "review_layout":
-        return layouts.review, *colors.values()
+        return layouts.review, *colors.values(), 
 
     elif button_id == "interpret_layout":
         m1.make_grid()
         m1.settings.legend=True
         m1.settings.dragmode='pan'
-        return layouts.interpret, *colors.values()
-
+        return layouts.interpret, *colors.values(), 
 
 layout_output_list = [
-        m1.output, dbdt1.output, dbdt2.output, rhoa.output, Multi_inv.output, Sing_inv.output, mod2.output,
+        m1.output, dbdt1.output, dbdt2.output, rhoa.output, mod2.output,
         
         Output('flex-layout',    'model', allow_duplicate=True),
 
@@ -785,7 +986,6 @@ layout_output_list = [
         Output('use-borehole', 'value', allow_duplicate=True),
         Output('use-borehole', 'label', allow_duplicate=True),
         Output('borehole-options-container', 'style', allow_duplicate=True),
-
 
         Output('url', 'hash', allow_duplicate=True),
 ]
@@ -817,6 +1017,7 @@ def handle_url_hash(url_hash, model):
         url_hash = '#load='+folder_path+'/'
     
     if url_hash.startswith('#change_working'):
+        # _configure_tk_dpi_awareness()
         root = Tk()
         root.withdraw()  # Hide the root window
         root.attributes('-topmost', True)
@@ -835,72 +1036,151 @@ def handle_url_hash(url_hash, model):
         folder = url_hash.split('=')[1].replace('%20', ' ').replace('%22', '')
         print(f'loading session from folder: {folder}')
         sesh = session.Session.from_folder(folder)
+        # res[-2] = sesh.save_dir
         res[-5] = sesh.save_dir
+
+
+        if hasattr(sesh, 'borehole_list') and sesh.borehole_list is not None:
+            # Transfer data to the display models
+            from Sections_plotting import get_borehole_projections
+            m1.boreholes = get_borehole_projections(sesh.borehole_list)
+            mod1.boreholes = get_borehole_projections(sesh.borehole_list)
+            mod2.boreholes = get_borehole_projections(sesh.borehole_list)
+            
+            # Transfer the color map
+            if hasattr(sesh, 'rock_map') and sesh.rock_map is not None:
+                m1.rock_color_map = sesh.rock_map
+                mod1.rock_color_map = sesh.rock_map
+                mod2.rock_color_map = sesh.rock_map
+            
+            res[-4] = True  # use-borehole value
+            res[-3] = html.Span(["Use Borehole Data ", 
+                    html.B("(Loaded from Session)", style={'color': '#28a745'}),
+                    html.Br(), # Adds a line break to keep it tidy
+                    html.Small("Upload a new .bor file below to overwrite existing data.", style={'color': '#6c757d', 'fontStyle': 'italic', 'fontSize': '0.85rem'})])
+            res[-2] = {'display': 'block', 'marginTop': '10px'} # container style
+            
+            res[0] = m1.render()
+        else:
+            # If no boreholes, ensure UI reflects that
+            res[-4] = False
+            res[-3] = "Use Borehole Data (optional)"
+            res[-2] = {'display': 'none'}
 
         if sesh.lines is not None:
             m1.lines = sesh.lines.copy()
             
         if sesh.data is not None:
             buffer_length = 50
-            start = 0
-            dbdt1.dataframe = sesh.data.copy()    
-            # dbdt2.dataframe = sesh.data.copy()    
-            m1.dataframe    = sesh.overview.copy()
-            full_df = sesh.data.copy()
             unique_sites = np.sort(sesh.site['site_id'].dropna().unique())
-            unique_sites = unique_sites[unique_sites != -1]
-            initial_sites = unique_sites[:buffer_length]
-            buffered_df = full_df[full_df['site_id'].isin(initial_sites)].copy()
+            initial_sites = unique_sites[:buffer_length].tolist()
 
-            dbdt1.dataframe = buffered_df
-            dbdt2.dataframe = full_df          # keep full section view
-            rhoa.dataframe  = buffered_df
-            m1.buffer_sites = initial_sites.tolist()
-            # dbdt2.buffer_sites = initial_sites.tolist()
-            dbdt2.buffer_start = start
-            dbdt2.buffer_len   = buffer_length
+            m1.buffer_sites = initial_sites        # <-- add this
+            mod1.buffer_sites = initial_sites  
 
-
+            dbdt1.dataframe = sesh.data.copy()    
+            dbdt2.dataframe = sesh.data.copy()    
+            m1.dataframe    = sesh.overview.copy()
+            rhoa.dataframe  = sesh.data.copy()    
             Multi_inv.dataframe = sesh.data.copy()
             Sing_inv.dataframe = sesh.data.copy()
             res[0] = m1.render()
             res[1] = dbdt1.render()
             res[2] = dbdt2.render()
             res[3] = rhoa.render()
-            res[4] = Multi_inv.render()
-            res[5] = Sing_inv.render()
         
         if sesh.models is not None:
             mod1.dataframe  = sesh.models.copy()
             mod2.dataframe  = sesh.models.copy()
-            res[6] = mod2.render()
+            res[4] = mod2.render()
 
+            res[6]   = 'secondary'
+            res[7]   = 'secondary'
+            res[8]   = 'secondary'
+            res[9]   = 'success'
+            res[10]  = 'secondary'
+            res[11]  = False
+            res[12]  = False
+            res[13]  = False
+            res[14]  = False
+            res[15]  = False
+        else:
+
+            res[6]   = 'success'
+            res[7]   = 'secondary'
             res[8]   = 'secondary'
             res[9]   = 'secondary'
             res[10]   = 'secondary'
-            res[11]   = 'success'
-            res[12]  = 'secondary'
-            res[13]  = False
-            res[14]  = False
-            res[15]  = False
-            res[16]  = False
-            res[17]  = False
-        else:
 
-            res[8]   = 'success'
-            res[9]   = 'secondary'
-            res[10]   = 'secondary'
-            res[11]   = 'secondary'
-            res[12]   = 'secondary'
-
+            res[11]  = False
+            res[12]  = False
             res[13]  = False
-            res[14]  = False
-            res[15]  = False
-            res[16]  = True
-            res[17]  = True
+            res[14]  = True
+            res[15]  = True
             
-    res[-1] = ''
+
     return res
+
+
+
+@app.callback(
+    Output(m1.id, 'figure', allow_duplicate=True),
+    Input(mod2.id, 'hoverData'), 
+    State(m1.id, 'figure'),
+    prevent_initial_call=True
+)
+def sync_hover_to_map(hoverData, current_fig):
+    if not hoverData or not current_fig:
+        return no_update
+    try:
+        # For Heatmaps, customdata is returned via the 'points' list
+        data = hoverData['points'][0].get('customdata')
+        if data is None or len(data) < 3:
+            return no_update
+        
+        if isinstance(data, dict):
+            site_id = data.get('0')
+            lat = float(data.get('1'))
+            lon = float(data.get('2'))
+        else:
+            site_id = data[0]
+            lat = float(data[1])
+            lon = float(data[2])
+
+        # If the ID is 'nan' (string), skip it
+        if site_id == "nan":
+            return no_update
+    except (KeyError, IndexError, TypeError, ValueError) as e:
+        print(f"Hover Unpack Error: {e}")
+        return no_update
+
+    # Update the Map Figure
+    fig = go.Figure(current_fig)
+    
+    # 1. Clear previous highlights
+    fig.data = [t for t in fig.data if t.name != 'hover-highlight']
+    
+    # 2. Add the new pinpoint
+    fig.add_trace(go.Scattermap(
+        lat=[lat],
+        lon=[lon],
+        mode='markers',
+        marker=dict(size=20,color='white',symbol='circle'),
+        name='hover-highlight',
+        showlegend=False
+    ))
+    
+    # Add a second smaller dot inside for a 'target' look
+    fig.add_trace(go.Scattermap(
+        lat=[lat], lon=[lon],
+        mode='markers',
+        marker=dict(size=8, color='red'),
+        name='hover-highlight',
+        showlegend=False
+    ))
+
+    return fig
+
 
 # import signal
 # @app.server.route("/shutdown", methods=["POST"])

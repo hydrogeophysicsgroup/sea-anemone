@@ -27,7 +27,9 @@ from scipy.spatial import cKDTree
 from pyproj import Geod
 
 from basepanel import Panel, gear_maker, dcc, PanelSettings
-from temframe import TEMframe
+# from temframe import TEMframe
+import temframe
+
 
 from panels import *
 
@@ -414,7 +416,7 @@ def get_boreholes_on_line(line_coords, bh_projections, search_radius_m=settings.
     return sorted(result, key=lambda x: x["dist_x"])
 
 def boreholes_to_dataframe(all_boreholes):
-    print("boreholes to df")
+    print("sections plotting.py here - boreholes to df")
     """
     Converts the nested 'all_boreholes' list into a flat pandas DataFrame.
     """

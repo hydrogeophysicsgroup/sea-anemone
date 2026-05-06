@@ -31,9 +31,9 @@ class Session:
     settings: SessionSettings = None
     save_dir: str = None
 
-    boreholes : DataFrame = None
-    rock_map : DataFrame = None
-    panel_ids: DataFrame = None
+    boreholes : pd.DataFrame = None
+    rock_map : dict      = None
+    panel_ids: pd.DataFrame = None
     dem_path: str = None
     dem_name: str = None
 
@@ -74,15 +74,17 @@ class Session:
             other.site = 'site.csv'                        
         if other.lines is not None:
             other.lines.to_csv(folder+'lines.csv', index=False)
-            other.lines = 'lines.csv'
-    
+            other.lines = 'lines.csv'    
         if other.boreholes is not None:
+            print("boreholes to dataframe here")
             other.boreholes.to_csv(folder+'boreholes.csv', index=False)
             other.boreholes = 'boreholes.csv'
-
         if other.rock_map is not None:
-            other.rock_map.to_csv(folder+'rock_map.csv', index=False)
+            # Convert dict {"Clay": "#hex"} to DataFrame for saving
+            df_rock = pd.DataFrame(list(other.rock_map.items()), columns=['RockType', 'Color'])
+            df_rock.to_csv(folder + 'rock_map.csv', index=False)
             other.rock_map = 'rock_map.csv'
+
 
         if other.forwards is not None:
             for i in range(len(other.forwards)):
@@ -115,6 +117,17 @@ class Session:
 
         if self.models is not None and isinstance(self.models, str):
             self.models = pd.read_csv(self.save_dir+self.models)
+
+        if self.boreholes is not None and isinstance(self.boreholes, str):
+            df_flat = pd.read_csv(self.save_dir + self.boreholes)            
+            from Sections_plotting import dataframe_to_boreholes
+            self.borehole_list = dataframe_to_boreholes(df_flat)
+            self.boreholes = df_flat
+        if self.rock_map is not None and isinstance(self.rock_map, str):
+            # This is the actual conversion step
+            rock_df = pd.read_csv(self.save_dir + self.rock_map)
+            self.rock_map = dict(zip(rock_df['RockType'], rock_df['Color']))
+
 
         if self.lines is not None and isinstance(self.lines, str):
             self.lines = pd.read_csv(self.save_dir+self.lines)

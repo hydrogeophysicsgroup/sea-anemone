@@ -291,6 +291,8 @@ class MapSettings(PanelSettings):
     line_width: int=3
     legend: bool = False
     mean_res: int = 0
+    Borehole_color: str = "#00e1ff"
+    Borehole_markersize: int=12
 
 
 class Map(Panel):
@@ -298,15 +300,15 @@ class Map(Panel):
     highlighted: int = None
     buffer_sites: list = None
     lines = None
-    
-
-    
+    boreholes = None       
+    rock_color_map = None
+       
 
     def __init__(self, data, **kwargs):
         settings = MapSettings(id='map', **kwargs)
         super().__init__(id='map', settings=settings)
         self.dataframe = data
-        self.layer_order=['tif', 'meanres', 'buffer', 'sites', 'highlight', 'lines']
+        self.layer_order=['tif', 'meanres', 'buffer', 'sites', 'highlight', 'lines', 'boreholes_outline', 'boreholes']
 
     def render(self):
         if self.dataframe is None: return self.empty_render()
@@ -374,12 +376,20 @@ class Map(Panel):
                     "source": ['https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}']
                 }])
         if self.highlighted is not None:
-            highlight_trace = px.scatter_map(df_plot[df_plot.index == self.highlighted], lat="latitude", lon="longitude", zoom=zoom, center=center, color_discrete_sequence=[self.settings.highlight_color])
+            # highlight_trace = px.scatter_map(df_plot[df_plot.index == self.highlighted], lat="latitude", lon="longitude", zoom=zoom, center=center, color_discrete_sequence=[self.settings.highlight_color])
+            highlighted_df = df_plot[df_plot.index.isin(self.highlighted)]
+            highlight_trace = px.scatter_map(
+                highlighted_df,
+                lat="latitude",
+                lon="longitude",
+                zoom=zoom,
+                center=center,
+                color_discrete_sequence=[self.settings.highlight_color])
+            
             highlight_trace.update_traces(marker=dict(size=self.settings.markersize*2))
             for trace in highlight_trace.data:
-                fig.add_trace(
-                    trace
-                )
+                fig.add_trace(trace)
+                c_layers.append("highlight")
 
         if self.lines is not None and self.settings.dragmode=='drawline':
             for line_id in self.lines.line.unique():
@@ -391,11 +401,43 @@ class Map(Panel):
             for i in range(len(fig2.data)):
                 c_layers.append(f'line_{i:02d}')
 
-        hovermode = False if self.settings.dragmode=='drawline' else None
+        hovermode = False #if self.settings.dragmode=='drawline' else None
         fig.update_layout(margin={"r":0,"t":0,"l":0,"b":0},
                           modebar=dict(add=['drawline', 'eraseshape'], remove=['zoomIn', 'zoomOut', 'lasso', 'toImage', 'plotly-logomark']),
                           newshape=dict(line_color='black', line_width=3, line_dash='dash'),
                           dragmode=self.settings.dragmode, hovermode=hovermode)
+        
+        # Add boreholes
+        if self.boreholes is not None:
+            bh_lats = [bh['map_lat'] for bh in self.boreholes]
+            bh_lons = [bh['map_lon'] for bh in self.boreholes]
+            bh_ids  = [bh['id'] for bh in self.boreholes]
+            # Outline trace
+            fig.add_trace(go.Scattermap(
+                    lat=bh_lats, lon=bh_lons,
+                    mode='markers',
+                    marker=dict(size=self.settings.Borehole_markersize+2, color='black', symbol='circle'),
+                    showlegend=False, hoverinfo='skip',
+                ))
+            c_layers.append('boreholes_outline')
+            fig.add_trace(go.Scattermap(
+                lat=bh_lats,
+                lon=bh_lons,
+                mode='markers',
+                marker=dict(size=self.settings.Borehole_markersize, color=self.settings.Borehole_color, symbol='circle'),
+                name='Boreholes',
+                text=bh_ids,
+                hovertemplate='%{text}<extra></extra>',
+                # showlegend=False,
+              ))
+            fig.update_layout(showlegend=True,
+                legend=dict(x=0.01, y=0.99,
+                    xanchor="left",yanchor="top",
+                    bgcolor="rgba(255,255,255,0.5)",  # semi-transparent background
+                    bordercolor="black",borderwidth=1,
+                ))
+            c_layers.append('boreholes')
+
         
         if hasattr(self, 'grid') and self.grid is not None:
             from __main__ import sesh
@@ -429,7 +471,8 @@ class Map(Panel):
                     xanchor="left",yanchor="top",
                     bgcolor="rgba(255,255,255,0.5)",  # semi-transparent background
                     bordercolor="black",borderwidth=1,
-                )
+                ),
+                # legend_itemsizing='constant',
             )
 
         return fig

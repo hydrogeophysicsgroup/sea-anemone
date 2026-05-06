@@ -22,7 +22,6 @@ class ModelGraph(Panel):
     
     def render(self):
         if self.dataframe is None: return self.empty_render()
-        # ...existing code...
         df_layers_long = pd.melt(
             self.dataframe,
             id_vars=['site_id', 'daytime', 'longitude', 'latitude', 'date', 'elevation', 'layer', 'resistivity'],
@@ -64,6 +63,9 @@ class ModelGraph(Panel):
                 go.Scatter(
                     x=df_highlighted["resistivity"],
                     y=df_highlighted["depth"],
+                    
+
+                    
                     mode="lines",
                     line=dict(width=2, color='red'),
                     zorder=10,
@@ -105,6 +107,10 @@ class ModelSectionSettings(PanelSettings):
     radius : float=100.0
     vmin: float=1.0
     vmax: float=500.
+    Min_bar_spacing: float = 0.3
+    Width_factor: float = 10
+    Borehole_radius : float=100.0
+
 
 class ModelSection(Panel):
     highlighted: int = None
@@ -113,6 +119,8 @@ class ModelSection(Panel):
     def __init__(self, **kwargs):
         settings = kwargs.pop('settings', ModelSectionSettings(id='model_section'))
         settings.radius=100.
+        settings.Borehole_radius = 100.
+        
         super().__init__(id='model_section', settings=settings)
         for key, value in kwargs.items():
             setattr(self, key, value)
@@ -123,6 +131,9 @@ class ModelSection(Panel):
         if sesh.lines is not None:
             line_id = np.unique(sesh.lines.line.values)
             options += [f'line {i:02d}' for i in line_id]
+
+        label_style = {"width": "110px", "textAlign": "right", "fontSize": "14px"}
+
         return  html.Div([
                     html.Div(
                         [
@@ -140,7 +151,8 @@ class ModelSection(Panel):
                                             "x-axis",
                                             html_for=self.id + "_axis",
                                             class_name="mb-0",
-                                            style={"width": "70px", "textAlign": "right"},
+                                            # style={"width": "70px", "textAlign": "right"},
+                                            style=label_style
                                         ),
                                         dbc.Select(
                                             id=self.id + "_axis",
@@ -157,10 +169,31 @@ class ModelSection(Panel):
                                             "radius",
                                             html_for=self.id + "_radius",
                                             class_name="mb-0",
-                                            style={"width": "70px", "textAlign": "right"},
+                                            # style={"width": "70px", "textAlign": "right"},
+                                            style=label_style
                                         ),
                                         dbc.Input(
                                             id=self.id + "_radius",
+                                            value=100.0,
+                                            type="number",
+                                            step=10.0,
+                                            disabled=True,
+                                            style={"width": "120px"},
+                                        ),
+                                    ],
+                                    style={"display": "flex", "alignItems": "center", "gap": "8px"},
+                                ),
+                                html.Div(
+                                    [
+                                        dbc.Label(
+                                            "Borehole_radius",
+                                            html_for=self.id + "_bor_radius",
+                                            class_name="mb-0",
+                                            # style={"width": "70px", "textAlign": "right"},
+                                            style=label_style
+                                        ),
+                                        dbc.Input(
+                                            id=self.id + "_bor_radius",
                                             value=100.0,
                                             type="number",
                                             step=10.0,
@@ -190,12 +223,129 @@ class ModelSection(Panel):
                     gear_maker(self.id)],
                     style={'height': '100%'} 
                 )
-    
-    def render_base(self):
+
+    def project_borehole_to_line(self, bh_x, bh_y, line_x, line_y):
+        from shapely.geometry import Point, LineString
+        """
+        bh_x, bh_y: UTM coordinates of borehole
+        line_x, line_y: Lists of UTM coordinates for the section line
+        returns: (distance_along_line, distance_from_line)
+        """
+        line = LineString(zip(line_x, line_y))
+        point = Point(bh_x, bh_y)
         
+        # 1. How far away is the borehole from the line?
+        dist_from_line = point.distance(line)
+
+        search_radius = self.settings.Borehole_radius
+        if search_radius is None:
+            search_radius = 100.0
+        
+        if dist_from_line > search_radius:
+            return None, dist_from_line
+        
+        # 2. How far along the line is the nearest point to the borehole?
+        dist_along_line = line.project(point)
+        
+        return dist_along_line, dist_from_line
+
+    def get_utm_epsg(self,lat, lon):
+        """
+        Returns the EPSG code for the UTM zone based on lat/lon.
+        """
+        zone = int(np.floor((lon + 180) / 6) + 1)
+        # 32600 is North, 32700 is South
+        base = 32600 if lat >= 0 else 32700
+        return base + zone
+
+    def transform_line_to_utm(self, lats, lons):
+        from pyproj import Transformer
+        """
+        Dynamically finds the EPSG and transforms the line coordinates.
+        """
+        if len(lats) == 0: return None, None
+        
+        # 1. Get EPSG from the first point of the line
+        epsg = self.get_utm_epsg(lats[0], lons[0]) 
+        
+        # 2. Create transformer
+        transformer = Transformer.from_crs("epsg:4326", f"epsg:{epsg}", always_xy=True)
+        
+        # 3. Transform
+        utmx, utmy = transformer.transform(lons, lats)
+        return utmx, utmy
+
+    def add_boreholes_to_section_fig(self, fig, df_boreholes, rock_map, x_axis_name, width, line_utm=None):
+        if df_boreholes is None or df_boreholes.empty:
+            return fig
+        
+        y_mode = self.settings.y_axis.lower()
+
+        # Group flat CSV rows by borehole ID
+        grouped = df_boreholes.groupby('bh_id')
+
+        for bh_id, group in grouped:
+            first_row = group.iloc[0]
+            
+            # COORDINATE LOGIC
+            if 'line' in x_axis_name and line_utm:
+                # Project UTM bh_x/bh_y onto the UTM line coordinates
+                bh_x, dist_to_line = self.project_borehole_to_line( first_row["bh_x"], first_row["bh_y"],  line_utm[0],  line_utm[1])
+                if bh_x is None:
+                    continue # Skip if outside radius
+            else:
+                # when plotted in site id
+                bh_x = first_row.get("bh_x") or bh_id
+
+
+            surface_z = 0 if y_mode == 'depth' else first_row["bh_elev"]
+
+            # PLOT THE LAYERS
+            for _, row in group.iterrows():
+                # Note: 'bh_elev' is the surface, layer_top/bottom are depths
+                z_top    = surface_z - float(row["layer_top"])
+                z_bottom = surface_z - float(row["layer_bottom"])
+
+                if y_mode == 'depth':
+                    z_top= - z_top
+                    z_bottom= - z_bottom
+                    pass
+                
+                x_box = [bh_x - width, bh_x + width, bh_x + width, bh_x - width, bh_x - width]
+                y_box = [z_top, z_top, z_bottom, z_bottom, z_top]
+
+                rock  = str(row.get("layer_desc", "")).strip()
+                color = rock_map.get(rock, "lightgray")
+
+                fig.add_trace(go.Scatter(
+                    x=x_box, y=y_box,
+                    fill="toself",
+                    fillcolor=color,
+                    mode="lines",
+                    line=dict(width=1, color="black"),
+                    name=rock,
+                    showlegend=False,
+                    hovertext=f"<b>BH: {bh_id}</b><br>{rock}<br>Depth: {row['layer_top']}-{row['layer_bottom']}m",
+                    hoverinfo="text"
+                ))
+
+            # Add Borehole ID Label at the top
+            fig.add_annotation(
+                x=bh_x, y=first_row["bh_elev"],
+                text=f"<b>{bh_id}</b>",
+                showarrow=False, yshift=15,
+                font=dict(size=10, color="black"),
+                bgcolor="rgba(255,255,255,0.8)")
+            
+        return fig
+
+    def render_base(self):
+
         if self.dataframe is None: return self.empty_render()
-        df = self.dataframe.copy()
+
+        # --- Select dataframe ---
         x_axis = self.settings.x_axis
+
         if x_axis.startswith('line'):
             line_id = int(float(x_axis.split(' ')[-1]))
             x_axis = f'_line_{line_id:0.0f}_x'
@@ -203,97 +353,181 @@ class ModelSection(Panel):
         if 'line' in x_axis:
             from __main__ import sesh
             df = sesh.models.copy()
-            df = df.loc[np.abs(df[x_axis.replace('_x', '_y')])<self.settings.radius]
-        
+            df = df.loc[np.abs(df[x_axis.replace('_x', '_y')]) < self.settings.radius]
+            width = self.settings.Min_bar_spacing * self.settings.Width_factor
+        else:
+            df = self.dataframe.copy()
+            width = self.settings.Min_bar_spacing 
+
+        # --- Clean + stabilize ---
+        df = df.copy()
+        df[x_axis] = df[x_axis].round(2)
+
         y_axis = self.settings.y_axis
-        res_grid = df.pivot_table('resistivity', x_axis, 'center_depth')
-        x   = np.sort(np.unique(df[x_axis].values))
-        y   = res_grid.columns.values.squeeze()
 
-        if y_axis=='elevation':
-            elev= df.pivot_table('elevation', x_axis).values.squeeze()
-            depth = res_grid.columns.values
+        pivot = df.pivot_table(
+            values='resistivity', index=x_axis, columns='center_depth',
+            aggfunc='first').sort_index()
+
+        # enforce consistent axis
+        x = pivot.index.values
+        depth = pivot.columns.values.squeeze()
+
+        
+        if y_axis == 'depth':
+            # FAKE flat elevation
+            elev = np.zeros(len(pivot.index))
             center_elev = elev[:, None] - depth[None, :]
-            d_elev = int(center_elev.max()-center_elev.min())+50
-            elev_axis = np.arange(d_elev)+center_elev.min()-25
+
+            d_elev = int(center_elev.max() - center_elev.min()) + 50
+            elev_axis = np.arange(d_elev) + center_elev.min() - 25
+
             dist = np.abs(elev_axis[:, None, None] - center_elev[None, :, :])
-            nearest_idx = dist.argmin(axis=-1)  # (n_elev, n_station)
+            nearest_idx = dist.argmin(axis=-1)
 
-            # Build station index grid
-            n_elev, n_station = nearest_idx.shape
-            station_idx = np.broadcast_to(
-                np.arange(n_station),
-                (n_elev, n_station)
-            )
+            n_elev, n_sites = nearest_idx.shape
+            station_idx = np.broadcast_to(np.arange(n_sites), (n_elev, n_sites))
 
-            # Direct advanced indexing
-            res_grid = res_grid.values[station_idx, nearest_idx]
+            res_grid = pivot.values[station_idx, nearest_idx]
+
+            # mask air / below model
             heaven = elev_axis[:, None] > elev[None, :]
-            hell   = elev_axis[:, None] < (elev[None, :]-depth.max()*1.1)
+            hell   = elev_axis[:, None] < (elev[None, :] - depth.max() * 1.1)
+
+            res_grid[heaven] = np.nan
+            res_grid[hell]   = np.nan
+
+            y = -elev_axis 
+
+            # y = depth
+            # res_grid = pivot.values.T  # (depth, site)
+
+        elif y_axis == 'elevation':
+
+            # elevation per site (aligned with pivot index!)
+            elev = df.groupby(x_axis)['elevation'].first().reindex(pivot.index).values
+
+            center_elev = elev[:, None] - depth[None, :]
+
+            d_elev = int(center_elev.max() - center_elev.min()) + 50
+            elev_axis = np.arange(d_elev) + center_elev.min() - 25
+
+            dist = np.abs(elev_axis[:, None, None] - center_elev[None, :, :])
+            nearest_idx = dist.argmin(axis=-1)
+
+            n_elev, n_sites = nearest_idx.shape
+            station_idx = np.broadcast_to(np.arange(n_sites), (n_elev, n_sites))
+
+            res_grid = pivot.values[station_idx, nearest_idx]
+
+            # mask air / below model
+            heaven = elev_axis[:, None] > elev[None, :]
+            hell   = elev_axis[:, None] < (elev[None, :] - depth.max() * 1.1)
 
             res_grid[heaven] = np.nan
             res_grid[hell]   = np.nan
 
             y = elev_axis
+
         else:
-            res_grid = res_grid.values.T
+            raise ValueError(f"Unknown y_axis: {y_axis}")
 
+        id_map = df.groupby(x_axis)[['site_id', 'latitude', 'longitude']].first()
+        site_info = id_map.reindex(pivot.index)[['site_id', 'latitude', 'longitude']].values
+        
         if self.settings.bars:
-            dx = np.abs(np.diff(x, prepend=0.))
-            dx_min = dx.min()*0.49
-            res_grid = np.repeat(res_grid, 3, axis=1)
-            x = np.repeat(x, 3)
-            x[::3] -= dx_min
-            x[2::3] += dx_min
             
-            dx = np.abs(np.diff(x, prepend=0.))
-            x_len = x.max()-x.min()
-            needs_gap = dx>0.03*x_len
+            n_sites = len(x)
+            n_depths = res_grid.shape[0]
 
-            if needs_gap.any():
-                x_with_gaps = np.zeros(len(x)+2*sum(needs_gap))
-                x_with_gaps[:] = np.nan
-                i_x = np.arange(len(x))+np.cumsum(2*needs_gap.astype(int))
-                x_with_gaps[i_x] = x            
-                res_elev_with_gaps = np.zeros(res_grid.shape[:1]+x_with_gaps.shape)
-                res_elev_with_gaps[:,:] = np.nan
-                res_elev_with_gaps[:, i_x] = res_grid
-                x = x_with_gaps*1.
-                res_grid = res_elev_with_gaps*1.
-        res_grid = np.log10(res_grid)        
+            # Use 4 points per site: [Left_Gap, Left_Edge, Right_Edge, Right_Gap]
+            x_plot = np.zeros(n_sites * 4)
+            res_new = np.full((n_depths, n_sites * 4), np.nan)
 
-        fig = px.imshow(
-            res_grid, x=x, y=y,
-            aspect='auto',
-            origin='lower',
-            color_continuous_scale='turbo',
-            labels={'x': x_axis.replace('_x', '').replace('_', ' ').strip(), 'y': y_axis, 'color': 'Resistivity [Ω·m]'},
+            for i in range(n_sites):
+                idx = 4 * i
+                center_x = x[i]
+                
+                # 1. Coordinate slightly left of the bar (NaN)
+                x_plot[idx]     = center_x - width - 0.0001
+                # 2. Left edge of bar
+                x_plot[idx + 1] = center_x - width
+                # 3. Right edge of bar
+                x_plot[idx + 2] = center_x + width
+                # 4. Coordinate slightly right of the bar (NaN)
+                x_plot[idx + 3] = center_x + width + 0.0001
+                
+                # Assign values only to the edges (idx+1 and idx+2)
+                # This creates a solid block of color between them
+                res_new[:, idx + 1] = res_grid[:, i]
+                res_new[:, idx + 2] = res_grid[:, i]
+
+            x_final = x_plot
+            res_grid_final = res_new
+
+            # for the hovermarker
+            site_info_expanded = np.repeat(site_info, 4, axis=0)
+            custom_data_grid = np.tile(site_info_expanded, (len(y), 1, 1))
+        else:
+            x_final = x
+            print("x final 2", x_final)
+            res_grid_final = res_grid
+
+            custom_data_grid = np.tile(site_info, (len(y), 1, 1))
+
+        # Final Plotting using Graph Objects for precision
+        import plotly.graph_objects as go
+                
+        fig = go.Figure(data=go.Heatmap(
+            z=np.log10(res_grid_final),
+            x=x_final,
+            y=y,
+            customdata=custom_data_grid,
+            hovertemplate="Site: %{customdata[0]}<extra></extra>",
+            zsmooth=False,
+            hoverongaps=False,
+            colorscale='turbo',
             zmin=np.log10(self.settings.vmin),
             zmax=np.log10(self.settings.vmax),
-        )
-        if y_axis=='depth':
-            fig.update_yaxes(autorange="reversed")
-        fig.update_layout(
-            coloraxis_colorbar=dict(
-                # tickvals = [0, 1, 2, np.log10(self.settings.vmax)],
-                # ticktext = ["1", "10", "100", str(int(self.settings.vmax))],
-                orientation="h",     # horizontal
-                y=-0.45,              # move below plot
-                x=0.5,               # center horizontally
+            # colorbar=dict(title='Resistivity [Ω·m]')
+            colorbar=dict(
+                orientation="h",
+                y=-0.75,        # Adjusted to move it below the X-axis title
+                x=0.5,
                 xanchor="center",
                 len=0.5,
-                thickness = 10,
-                title=dict(
-                    text="Resistivity [Ωm]",
-                    side="bottom")
-                ),
+                thickness=15,
+                title=dict(text="Resistivity [log10 Ωm]", side="bottom"))
+        ))
+
+        if y_axis == 'depth':
+            fig.update_yaxes(autorange="reversed")
+
+        pad = self.settings.Min_bar_spacing * 2
+        
+        # Filter out NaNs to find the real min/max for the range
+        valid_x = x_final[~np.isnan(x_final)]
+        x_min, x_max = np.min(valid_x), np.max(valid_x)
+
+        # 3. Update Layout
+        fig.update_layout(
             xaxis=dict(
-                title_standoff=4   # default is ~15–20
+                type='linear', 
+                title=x_axis.replace('_x', '').replace('_', ' ').strip(),
+                range=[x_min, x_max], # Forces the first bar to show fully
+                title_standoff=4
             ),
-            hovermode="x")
+            yaxis=dict(title=y_axis),
+            plot_bgcolor='white',
+            # hovermode="x",
+            hovermode="closest",
+            margin=dict(b=100) # Add bottom margin to make room for horizontal colorbar
+        )
+
         return fig
-    
+
     def render(self):
+       
         if self.dataframe is None: return self.empty_render()
         fig = self.render_base()
 
@@ -302,42 +536,51 @@ class ModelSection(Panel):
         if x_axis.startswith('line'):
             line_id = int(float(x_axis.split(' ')[-1]))
             x_axis = f'_line_{line_id:0.0f}_x'
-
+        
+        line_coords_utm = None 
+        
         if 'line' in x_axis:
             from __main__ import sesh
             df = sesh.models.copy()
             df = df.loc[np.abs(df[x_axis.replace('_x', '_y')])<self.settings.radius]        
             x_min = 0
             x_max = sesh.lines[sesh.lines.line==line_id].total_length.max()
+            current_width = self.settings.Min_bar_spacing * self.settings.Width_factor
 
+            # Filter the line from session
+            c_line = sesh.lines.loc[sesh.lines.line == line_id] 
+            
+            if not c_line.empty:
+                from pyproj import Transformer
+                epsg = self.get_utm_epsg(c_line.latitude.iloc[0], c_line.longitude.iloc[0])
+                
+                transformer = Transformer.from_crs("epsg:4326", f"epsg:{epsg}", always_xy=True)
+                utmx, utmy = transformer.transform(c_line.longitude.values, c_line.latitude.values)
+                
+                line_coords_utm = (utmx, utmy)
         else:
+            current_width = self.settings.Min_bar_spacing
             x_min = None
             x_max = None
+
+        from __main__ import sesh
+        if sesh.boreholes is not None and not sesh.boreholes.empty:
+           fig = self.add_boreholes_to_section_fig(fig, sesh.boreholes, sesh.rock_map, x_axis,current_width,
+                line_utm=line_coords_utm)
+
 
         df_layers_long = df.melt(
             id_vars=[x_axis, 'resistivity', 'misfit','doi', 'layer', 'elevation'],
             value_vars=['top_depth', 'bottom_depth'],
             var_name='depth_type',
-            value_name='depth'
-        ).sort_values([x_axis, 'layer', 'depth'])
+            value_name='depth').sort_values([x_axis, 'layer', 'depth'])
         fig.update_layout(yaxis2=dict(title='Misfit',overlaying='y',side='right',showgrid=False))
         # ---- Misfit only for buffered sites ----
         if self.settings.misfit:
-            misfit_df = (
-                df_layers_long
-                .groupby(x_axis)['misfit']
-                .first()
-                .reset_index()
-            )
+            misfit_df = (df_layers_long.groupby(x_axis)['misfit'].first().reset_index())
 
-            misfit_trace = go.Scatter(
-                x=misfit_df[x_axis],
-                y=misfit_df['misfit'],
-                mode='lines',
-                line=dict(color='black', width=2),
-                name='Misfit',
-                yaxis='y2'
-            )
+            misfit_trace = go.Scatter(x=misfit_df[x_axis],y=misfit_df['misfit'],mode='lines',line=dict(color='black', width=2),
+                name='Misfit',yaxis='y2')
 
             y_dashed = misfit_df['misfit'].copy()
             y_dashed[y_dashed <= 8] = np.nan
@@ -349,8 +592,7 @@ class ModelSection(Panel):
                 mode="lines",
                 line=dict(color="rgba(0,0,0,0.7)", dash="dash"),
                 showlegend=False,
-                yaxis='y2'
-            ))
+                yaxis='y2'))
 
             fig.add_trace(misfit_trace)
 
@@ -361,6 +603,7 @@ class ModelSection(Panel):
             fig.update_layout(yaxis2=dict(title=dict(text="Misfit",standoff=10),overlaying="y",side="right",showgrid=False))
         
         doi_df = (df_layers_long.groupby(x_axis)["doi"].first().reset_index())        
+
         if self.settings.y_axis=='elevation':
             doi_df['doi'] = df.groupby(x_axis)['elevation'].first().values - doi_df['doi'].values
             ylim = [doi_df["doi"].min()-8, df_layers_long["elevation"].max()+8]
@@ -391,6 +634,9 @@ class ModelSection(Panel):
                             [y_max + 50],
                             [y_max + 50]
                         ]),
+                        
+
+
                         fill="toself",
                         fillcolor="rgba(255,255,255,0.6)",
                         line=dict(width=0),
@@ -430,6 +676,8 @@ class ModelSection(Panel):
             fig.update_layout(yaxis2=dict(range=[0, 8]))
         return fig
         
+
+
         # def add_callbacks(self, app):
         #     super().add_callbacks(app)
 
@@ -478,19 +726,6 @@ class ModelSection(Panel):
 
     def add_callbacks(self, app):
         super().add_callbacks(app)
-
-        @app.callback(
-            Output(self.id+'_radius', 'disabled'),
-            Output({'type': f'settings-{self.id}', 'key': 'x_axis'}, 'value'),
-            Input(self.id+'_axis', 'value'),
-            prevent_initial_call=True
-        )
-        def update_xaxis(x_axis):
-            disabled=True
-            if x_axis.startswith('line'):
-                disabled = False
-            self.settings.x_axis=x_axis
-            return disabled, x_axis
     
         @app.callback(
             Output({'type': f'settings-{self.id}', 'key': 'radius'}, 'value'),
@@ -500,3 +735,32 @@ class ModelSection(Panel):
         def update_radius(radius):
             self.settings.radius=radius
             return radius
+        
+
+        @app.callback(
+            # Combine all Outputs triggered by the x-axis dropdown here
+            Output(self.id + '_radius', 'disabled'),    # The model radius slider
+            Output(self.id + '_bor_radius', 'disabled'), # The borehole radius slider
+            Output({'type': f'settings-{self.id}', 'key': 'x_axis'}, 'value'),
+            Input(self.id + '_axis', 'value'),
+            prevent_initial_call=True
+        )
+        def update_xaxis_and_ui_states(x_axis):
+            # Determine if radius controls should be enabled
+            # (Only enabled if we are in 'line' mode)
+            is_not_line = not str(x_axis).startswith('line')
+            
+            # Update the internal settings object
+            self.settings.x_axis = x_axis
+            
+            # Return values for all three outputs in order
+            return is_not_line, is_not_line, x_axis
+
+        @app.callback(
+            Output({'type': f'settings-{self.id}', 'key': 'Borehole_radius'}, 'value'),
+            Input(self.id+'_bor_radius', 'value'),
+            prevent_initial_call=True
+        )
+        def update_Borehole_radius(Borehole_radius):
+            self.settings.Borehole_radius=Borehole_radius
+            return Borehole_radius
