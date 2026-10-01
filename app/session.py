@@ -28,6 +28,13 @@ class Session:
     site:   pd.DataFrame = None
     lines:  pd.DataFrame = None
     forwards: List[Forward] = None
+    # Name for every instrument represented in `forwards`. Each instrument
+    # contributes exactly 2 consecutive entries to `forwards` (low moment,
+    # high moment), so instrument_names[i] pairs with forwards[2*i] and
+    # forwards[2*i+1] -- this mirrors the system_id offsets used in `data`
+    # (see usf_import.from_sweeps_multi). None/omitted means the legacy
+    # single-instrument case: forwards is just [lm, hm].
+    instrument_names: List[str] = None
     settings: SessionSettings = None
     save_dir: str = None
 
@@ -39,13 +46,109 @@ class Session:
 
     def __post_init__(self):
         self._dmfwr = None
-    
+        self._dmfwr_cache = {}
+
     @property
     def dmfwr(self):
+        """
+        Combined dual-moment forward operator for the single-instrument case.
+        Kept for backwards compatibility. Raises if more than one instrument
+        is loaded, since there's no longer one unambiguous forward operator
+        to hand back -- use dmfwr_for(instrument_name) instead.
+        """
+        if self.instrument_names is not None and len(self.instrument_names) > 1:
+            raise ValueError(
+                f"Multiple instruments loaded ({self.instrument_names}) -- "
+                "use dmfwr_for(instrument_name) instead of .dmfwr."
+            )
         if self._dmfwr is None:
             self._dmfwr = self.forwards[0] + self.forwards[1]
         return self._dmfwr
 
+    def dmfwr_for(self, instrument):
+        """
+        Combined dual-moment forward operator for one instrument.
+
+        Looks up instrument's (lm, hm) pair in self.forwards via
+        self.instrument_names and merges them with '+', same as the
+        original single-instrument dmfwr did.
+        """
+        if self.instrument_names is None:
+            if instrument is not None:
+                raise ValueError(
+                    "This session has no instrument_names set (single-instrument "
+                    "session) -- use .dmfwr instead."
+                )
+            return self.dmfwr
+
+        if instrument not in self._dmfwr_cache:
+            i = self.instrument_names.index(instrument)
+            self._dmfwr_cache[instrument] = self.forwards[2 * i] + self.forwards[2 * i + 1]
+        return self._dmfwr_cache[instrument]
+
+    def merge_upload(self, new_data, new_forwards, new_instrument_names):
+        """
+        Absorb one temframe.from_zip_content()-shaped (data, forwards,
+        instrument_names) result into this session -- handles both the
+        very first upload (self.data is None) and merging onto existing
+        data, so callers never need an if/else.
+
+        site_id/system_id/data_id are assigned fresh from 0 by
+        temframe.from_sweeps_multi on every call, so two independently
+        uploaded files collide on all three unless offset here. system_id
+        is relied on elsewhere as `% 2 == 0` -> low moment / `== 1` ->
+        high moment (panels.py, inversion_panels.py), so a reused
+        instrument keeps its existing (even, even+1) block untouched, and
+        a genuinely new instrument always lands on a fresh even offset.
+        """
+        if self.data is None:
+            self.data = new_data
+            self.forwards = list(new_forwards)
+            self.instrument_names = list(new_instrument_names)
+        else:
+            new_data = new_data.copy()
+
+            # site_id: offset past the current max (skip -1, the sentinel
+            # used elsewhere for unassigned sites)
+            site_offset = int(self.data['site_id'].max()) + 1
+            mask = new_data['site_id'] != -1
+            new_data.loc[mask, 'site_id'] = new_data.loc[mask, 'site_id'] + site_offset
+
+            # data_id: always dense/unique, no sentinel
+            data_offset = int(self.data['data_id'].max()) + 1
+            new_data['data_id'] = new_data['data_id'] + data_offset
+
+            if self.instrument_names is None:  # legacy single-instrument session
+                self.instrument_names = ['__legacy__']
+
+            # system_id: reuse an existing instrument's block (same
+            # forwards, no duplicate instrument_names entry); allocate a
+            # fresh even offset for a genuinely new instrument
+            for idx_new, instrument_name in enumerate(new_instrument_names):
+                old_offset = idx_new * 2
+                if instrument_name in self.instrument_names:
+                    new_offset = self.instrument_names.index(instrument_name) * 2
+                else:
+                    new_offset = len(self.instrument_names) * 2
+                    self.instrument_names.append(instrument_name)
+                    self.forwards.extend(new_forwards[idx_new * 2: idx_new * 2 + 2])
+
+                if new_offset != old_offset:
+                    rows = new_data['instrument'] == instrument_name
+                    new_data.loc[rows, 'system_id'] = new_data.loc[rows, 'system_id'] - old_offset + new_offset
+                    new_data.loc[rows, 'sys_gate'] = new_data.loc[rows, 'system_id'] + new_data.loc[rows, 'gate_id'] / 1e6
+
+            self.data = pd.concat([self.data, new_data], ignore_index=True)
+            self.data.sort_values(by=['site_id', 'system_id', 'gate_id'], inplace=True)
+            self.data.reset_index(drop=True, inplace=True)
+
+        self.data['include'] = self.data['inuse_manual'].astype(bool, copy=True).fillna(self.data['inuse_auto'])
+        # Existing rows in self.data (and therefore self.models) keep their
+        # original site_id -- only the newly-merged block above is offset --
+        # so any prior inversion results remain valid and must NOT be
+        # cleared here. The new sites simply have no rows in self.models
+        # yet, same as any not-yet-inverted site.
+        return self
 
     def save(self, folder=None, binary_threshold=100):
         self.update_site_table()
@@ -162,6 +265,8 @@ class Session:
                         utm_y=('utm_y','first'),
                         distance=('distance','first'),
                         )
+            if 'instrument' in df.columns:
+                aggfunc['instrument'] = ('instrument', 'first')
 
             if 'misfit' in df.columns:
                 aggfunc['misfit'] = ('misfit', rounded_nanmean)
@@ -472,6 +577,9 @@ class Session:
         obj = cls()
         obj.data = df_data.copy()
         obj.forwards = forwards
+        # Workbench files are always a single instrument's LM/HM (or more)
+        # segments, so there's no separate instrument grouping to track --
+        # leave instrument_names unset and let .dmfwr work as before.
 
         df = df_mod.copy()
         df.columns = df.columns.str.lower()

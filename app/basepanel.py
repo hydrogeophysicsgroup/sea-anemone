@@ -24,6 +24,27 @@ def gear_maker(id):
     )
     return gear
 
+# Shared look for the small floating control boxes that sit directly on
+# top of a plot (e.g. Map's plot-by/mean-res selects, Model Section's
+# x-axis/radius controls) -- factored out here so every panel that has
+# one gets the same background/padding/shadow instead of each panel
+# hand-rolling its own slightly different box.
+FLOATING_BOX_STYLE = {
+    "position": "absolute",
+    "display": "flex",
+    "flexDirection": "column",
+    "gap": "8px",
+    "zIndex": 1000,
+    "backgroundColor": "rgba(255,255,255,0.9)",
+    "padding": "8px 10px",
+    "borderRadius": "8px",
+    "boxShadow": "0 1px 4px rgba(0,0,0,0.25)",
+}
+
+FLOATING_BOX_ROW_STYLE = {"display": "flex", "alignItems": "center", "gap": "8px"}
+
+FLOATING_BOX_LABEL_STYLE = {"width": "90px", "textAlign": "right", "fontSize": "13px"}
+
 def find_tab_by_id(tabs, tab_id, path=None):
     if path is None: path = []
 
@@ -42,7 +63,7 @@ def find_tab_by_id(tabs, tab_id, path=None):
                 return new_path
     return None
 
-def update_tabset(json_data, target_tab_id, settings_tab_id, change_order=False):
+def update_tabset(json_data, target_tab_id, settings_tab_id, change_order=False, name=None):
     accessor_chain = find_tab_by_id(json_data, target_tab_id)
     accessor_string = ''
     for key in accessor_chain[:-1]:
@@ -57,7 +78,11 @@ def update_tabset(json_data, target_tab_id, settings_tab_id, change_order=False)
         tablist.insert(idx+1, {
             'type': 'tab',
             'id': settings_tab_id,
-            'name': target_tab_id.replace('tab-', '')+' settings',
+            # A caller-supplied name (e.g. a panel's settings.title) takes
+            # priority; falls back to deriving one from the raw tab id
+            # (e.g. 'tab-tTEM' -> 'tTEM settings') for panels that don't
+            # set a nicer title.
+            'name': name if name else target_tab_id.replace('tab-', '')+' settings',
             'component': 'text',
         })
         tabset.insert(idx+1, settings_tab_id)
@@ -138,6 +163,26 @@ class PanelSettings:
     id: str
     _settings_schema: dict = None
     title: str = None
+    # Plain class attribute (no type annotation), NOT a dataclass field --
+    # subclasses can override with a set of schema property names to omit
+    # from the auto-generated gear form. Needed for internal/non-primitive
+    # fields (e.g. a dict holding viewport state): the generic render()
+    # fallback renders any field without a dedicated special_renders match
+    # as a plain text dbc.Input, and update_render() (Panel.add_callbacks)
+    # writes that Input's raw string value straight back via setattr on
+    # every settings-form change (not just changes to that specific field,
+    # since all settings inputs share one pattern-matching callback) --
+    # silently corrupting a dict-typed field into a string the next time
+    # any OTHER setting changes.
+    hidden_settings = frozenset()
+    # Plain class attribute (see hidden_settings above) -- subclasses can
+    # override with {field_key: {enum_value: 'Nice Label'}} to give an
+    # enum field's choices friendlier display text than their raw values.
+    # dataclasses_jsonschema's field metadata only recognizes title/
+    # description/examples/extensions/read_only/write_only, not a per-
+    # choice label, so enum choice labels can't be set the same way
+    # `metadata={'title': ...}` sets a field's own row label.
+    enum_labels = {}
     def __init__(self, id):
         self.id = id
 
@@ -167,8 +212,9 @@ class PanelSettings:
             )
         enum_check = lambda key, prop: 'enum' in prop
         def enum_render(key, prop):
+            labels = self.enum_labels.get(key, {})
             return dbc.Select(
-                options=[{"label": v, "value": v} for v in prop['enum']],
+                options=[{"label": labels.get(v, v), "value": v} for v in prop['enum']],
                 id={'type': f'settings-{self.id}', 'key': key},
                 value=eval(f'self.{key}'),
                 style={'margin': '5px'}
@@ -196,6 +242,8 @@ class PanelSettings:
         n_special_renders = len(special_renders)
 
         for key, prop in self.schema.get('properties', {}).items():
+            if key in self.hidden_settings:
+                continue
             row_children = []
             row_children.append(dbc.Label(prop.get('title', key), style={'marginRight': '10px'}))
 
@@ -274,9 +322,9 @@ class PanelSettings:
         )
         def show_settings(n_clicks, model):
             if n_clicks:
-                return update_tabset(model, f'tab-{self.id}', f'tab-{self.id}_settings', change_order=True)
+                return update_tabset(model, f'tab-{self.id}', f'tab-{self.id}_settings', change_order=True, name=self.title)
             else:
-                raise PreventUpdate        
+                raise PreventUpdate
         
         @app.callback(
             Output('flex-layout', 'model', allow_duplicate=True),
@@ -292,7 +340,7 @@ class PanelSettings:
 
     @property
     def flat_keys(self):
-        all_keys = list(self.schema.get('properties', {}).keys())
+        all_keys = [k for k in self.schema.get('properties', {}).keys() if k not in self.hidden_settings]
         key_elements = []
         for key in all_keys:
             if self.schema['properties'][key].get('type') == 'array':

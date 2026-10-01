@@ -1,3 +1,17 @@
+/* Dash's default HTML template doesn't give html/body/#react-entry-point
+   an explicit height, so percentage-height children (including
+   FlexLayout's own internal CSS) have nothing well-defined to size
+   against -- app.py's own top-level container uses viewport units (vh)
+   to sidestep this, but this keeps the whole chain consistent too, and
+   the 0 margin avoids the body's default margin pushing content past
+   100vh. Overflow is left at the default (not forced hidden) so any
+   content taller than the viewport stays reachable via a normal
+   scrollbar rather than silently clipped. */
+html, body {
+    height: 100%;
+    margin: 0;
+}
+
 /* #clickable-paragraph:hover {
     color: blue; /* Change text color on hover */
     text-decoration: underline; /* Add underline to mimic hyperlink */

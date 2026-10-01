@@ -87,6 +87,8 @@ def toggle_dem_inputs(source, current_value):
     Output('output-dem-load', 'children'),
     Output('output-data-summary', 'children', allow_duplicate=True),
     Output('dem-applied', 'data'),
+    Output('dem-toast', 'is_open', allow_duplicate=True),
+    Output('dem-toast', 'children', allow_duplicate=True),
     Input('load-dem-vs-gps', 'n_clicks'),
     State('use-dem', 'value'),
     prevent_initial_call=True
@@ -95,9 +97,9 @@ def load_dem_vs_gps(n_clicks, use_dem):
     if not n_clicks:
         raise PreventUpdate
     if not use_dem:
-        return html.Div("Enable 'Use DEM' first."), build_data_summary(), False
+        return html.Div("Enable 'Use DEM' first."), build_data_summary(), False, True, "Enable 'Use DEM' first."
     if not sesh.dem_path or not os.path.exists(sesh.dem_path):
-        return html.Div("No DEM found. Please download or upload a DEM first."), build_data_summary(), False
+        return html.Div("No DEM found. Please download or upload a DEM first."), build_data_summary(), False, True, "No DEM found. Please download or upload a DEM first."
 
     stats = build_gps_dem_summary()
     replace_error = None
@@ -148,12 +150,15 @@ def load_dem_vs_gps(n_clicks, use_dem):
         message_children.append(html.Div(f"DEM elevation replace failed: {replace_error}"))
 
     dem_applied = replace_error is None
-    return html.Div(message_children), build_data_summary(), dem_applied
+    toast_msg = "DEM loaded. GPS vs DEM updated." if replace_error is None else f"DEM elevation replace failed: {replace_error}"
+    return html.Div(message_children), build_data_summary(), dem_applied, True, toast_msg
 
 @app.callback(
     Output('output-dem-load', 'children', allow_duplicate=True),
     Output('output-data-summary', 'children', allow_duplicate=True),
     Output('dem-applied', 'data', allow_duplicate=True),
+    Output('dem-toast', 'is_open', allow_duplicate=True),
+    Output('dem-toast', 'children', allow_duplicate=True),
     Input('restore-gps-elevation', 'n_clicks'),
     prevent_initial_call=True
 )
@@ -161,10 +166,10 @@ def restore_gps_elevation(n_clicks):
     if not n_clicks:
         raise PreventUpdate
     if sesh.data is None:
-        return html.Div("No data loaded."), build_data_summary(), False
+        return html.Div("No data loaded."), build_data_summary(), False, True, "No data loaded."
     df = sesh.data
     if 'elevation_gps' not in df.columns:
-        return html.Div("No GPS elevation backup found."), build_data_summary(), False
+        return html.Div("No GPS elevation backup found."), build_data_summary(), False, True, "No GPS elevation backup found."
 
     df['elevation'] = df['elevation_gps']
     sesh.data = df
@@ -174,7 +179,7 @@ def restore_gps_elevation(n_clicks):
     if dbdt2.dataframe is not None and 'site_id' in df.columns:
         dbdt2.dataframe = df[df['site_id'].isin(dbdt2.dataframe['site_id'].unique())]
 
-    return html.Div("GPS elevation restored."), build_data_summary(), False
+    return html.Div("GPS elevation restored."), build_data_summary(), False, True, "GPS elevation restored."
 
 @app.callback(
     Output('restore-gps-elevation', 'disabled'),
@@ -190,6 +195,8 @@ def toggle_restore_button(dem_applied, use_dem):
     Output('output-data-summary', 'children', allow_duplicate=True),
     Output('dem-downloaded', 'data', allow_duplicate=True),
     Output('dem-loaded', 'data', allow_duplicate=True),
+    Output('dem-toast', 'is_open', allow_duplicate=True),
+    Output('dem-toast', 'children', allow_duplicate=True),
     Input('upload-dem', 'contents'),
     State('upload-dem', 'filename'),
     State('use-dem', 'value'),
@@ -221,13 +228,15 @@ def upload_dem(contents, filename, use_dem):
     sesh.dem_path = dem_path
     sesh.dem_name = safe_name
 
-    return html.Div(f"DEM uploaded: {safe_name}"), build_data_summary(), False
+    return html.Div(f"DEM uploaded: {safe_name}"), build_data_summary(), False, True, True, f"DEM uploaded: {safe_name}"
 
 @app.callback(
     Output('output-dem-download', 'children'),
     Output('output-data-summary', 'children', allow_duplicate=True),
     Output('dem-downloaded', 'data', allow_duplicate=True),
     Output('dem-loaded', 'data', allow_duplicate=True),
+    Output('dem-toast', 'is_open', allow_duplicate=True),
+    Output('dem-toast', 'children', allow_duplicate=True),
     Input('download-dem', 'n_clicks'),
     State('use-dem', 'value'),
     State('dem-source', 'value'),
@@ -241,15 +250,18 @@ def upload_dem(contents, filename, use_dem):
     prevent_initial_call=True
 )
 def download_dem(n_clicks, use_dem, source, api_key, min_lon, min_lat, max_lon, max_lat, resolution):
+    def _fail(message):
+        return html.Div(message), build_data_summary(), False, False, True, message
+
     if not n_clicks:
         raise PreventUpdate
     if not use_dem:
-        return html.Div("Enable 'Use DEM' first."), build_data_summary(), False, False
+        return _fail("Enable 'Use DEM' first.")
 
     if None in (min_lon, min_lat, max_lon, max_lat):
-        return html.Div("Please enter a complete bbox (min/max lon/lat)."), build_data_summary(), False, False
+        return _fail("Please enter a complete bbox (min/max lon/lat).")
     if min_lon >= max_lon or min_lat >= max_lat:
-        return html.Div("Invalid bbox: min values must be less than max values."), build_data_summary(), False, False
+        return _fail("Invalid bbox: min values must be less than max values.")
 
     download_url = None
     safe_name = None
@@ -265,9 +277,9 @@ def download_dem(n_clicks, use_dem, source, api_key, min_lon, min_lat, max_lon, 
         }
         demtype = demtype_map.get(resolution)
         if not demtype:
-            return html.Div("Please choose a global DEM resolution."), build_data_summary(), False, False
+            return _fail("Please choose a global DEM resolution.")
         if not api_key_value:
-            return html.Div("OpenTopography requires an API key. Paste it above."), build_data_summary(), False, False
+            return _fail("OpenTopography requires an API key. Paste it above.")
 
         ot_params = {
             'demtype': demtype,
@@ -287,7 +299,7 @@ def download_dem(n_clicks, use_dem, source, api_key, min_lon, min_lat, max_lon, 
         }
         download_url = etopo_map.get(resolution)
         if not download_url:
-            return html.Div("Please choose an ETOPO resolution."), build_data_summary(), False, False
+            return _fail("Please choose an ETOPO resolution.")
 
         base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
         dem_dir = os.path.join(base_dir, 'cache', 'dem')
@@ -304,7 +316,7 @@ def download_dem(n_clicks, use_dem, source, api_key, min_lon, min_lat, max_lon, 
                             if chunk:
                                 f.write(chunk)
             except Exception as exc:
-                return html.Div(f"ETOPO download failed: {exc}"), build_data_summary(), False, False
+                return _fail(f"ETOPO download failed: {exc}")
 
         safe_name = _sanitize_filename(
             f"etopo_{resolution}_{min_lat:.6f}_{min_lon:.6f}_{max_lat:.6f}_{max_lon:.6f}.tif"
@@ -335,14 +347,15 @@ def download_dem(n_clicks, use_dem, source, api_key, min_lon, min_lat, max_lon, 
                 ) as dst:
                     dst.write(data, 1)
         except Exception as exc:
-            return html.Div(f"ETOPO clip failed: {exc}"), build_data_summary(), False, False
+            return _fail(f"ETOPO clip failed: {exc}")
 
         sesh.dem_path = dem_path
         sesh.dem_name = safe_name
 
-        return html.Div(f"DEM downloaded: {safe_name}"), build_data_summary(), True, True
+        msg = f"DEM downloaded: {safe_name}"
+        return html.Div(msg), build_data_summary(), True, True, True, msg
     else:
-        return html.Div("Unknown DEM source."), build_data_summary(), False, False
+        return _fail("Unknown DEM source.")
 
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     dem_dir = os.path.join(base_dir, 'cache', 'dem')
@@ -361,12 +374,13 @@ def download_dem(n_clicks, use_dem, source, api_key, min_lon, min_lat, max_lon, 
                     if chunk:
                         f.write(chunk)
     except Exception as exc:
-        return html.Div(f"Download failed: {exc}"), build_data_summary(), False, False
+        return _fail(f"Download failed: {exc}")
 
     sesh.dem_path = dem_path
     sesh.dem_name = safe_name
 
-    return html.Div(f"DEM downloaded: {safe_name}"), build_data_summary(), True
+    msg = f"DEM downloaded: {safe_name}"
+    return html.Div(msg), build_data_summary(), True, True, True, msg
 
 @app.callback(
     Output('save-dem', 'disabled'),
@@ -389,20 +403,25 @@ def reset_dem_downloaded(use_dem):
 
 @app.callback(
     Output('output-dem-save', 'children'),
+    Output('dem-toast', 'is_open', allow_duplicate=True),
+    Output('dem-toast', 'children', allow_duplicate=True),
     Input('save-dem', 'n_clicks'),
     State('dem-downloaded', 'data'),
     State('use-dem', 'value'),
     prevent_initial_call=True
 )
 def save_dem(n_clicks, dem_downloaded, use_dem):
+    def _fail(message):
+        return html.Div(message), True, message
+
     if not n_clicks:
         raise PreventUpdate
     if not use_dem:
-        return html.Div("Enable 'Use DEM' first.")
+        return _fail("Enable 'Use DEM' first.")
     if not dem_downloaded:
-        return html.Div("Please download a DEM first.")
+        return _fail("Please download a DEM first.")
     if not sesh.dem_path or not os.path.exists(sesh.dem_path):
-        return html.Div("No DEM file found to save.")
+        return _fail("No DEM file found to save.")
     filename = sesh.dem_name or os.path.basename(sesh.dem_path)
     filename = os.path.splitext(filename)[0]
 
@@ -431,7 +450,7 @@ def save_dem(n_clicks, dem_downloaded, use_dem):
             save_path_effective = save_path_effective + ".tif"
         shutil.copy2(sesh.dem_path, save_path_effective)
     except Exception as exc:
-        return html.Div(f"DEM save failed: {exc}")
+        return _fail(f"DEM save failed: {exc}")
 
     kml_msg = None
     kml_path = None
@@ -449,17 +468,17 @@ def save_dem(n_clicks, dem_downloaded, use_dem):
                 html.Li(save_path_effective),
                 html.Li(kml_path),
             ])
-        ])
+        ]), True, "DEM and KML exported."
     if kml_msg:
         return html.Div([
             html.Div("DEM saved:"),
             html.Ul([html.Li(save_path_effective)]),
             html.Div(kml_msg)
-        ])
+        ]), True, f"DEM saved. {kml_msg}"
     return html.Div([
         html.Div("DEM saved:"),
         html.Ul([html.Li(save_path_effective)])
-    ])
+    ]), True, "DEM saved."
 
 @app.callback(
     Output('dem-api-key-list', 'children'),

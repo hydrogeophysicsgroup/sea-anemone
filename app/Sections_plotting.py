@@ -1060,8 +1060,9 @@ def generate_res_step_graph_elev(row, row_index, label=None, elevation=None,step
     bottom = np.array(row.get('bottom_depth', [])).astype(float)
 
     doi = extract_doi_value(row.get("doi", 0))
+    raw_doi_valid = pd.notnull(doi) and doi > 0
     valid = np.isfinite(res) & np.isfinite(top) & np.isfinite(bottom)
-    res, top, bottom, = res[valid], top[valid], bottom[valid], 
+    res, top, bottom, = res[valid], top[valid], bottom[valid],
 
     if len(res) == 0:
         return go.Figure().add_annotation(text="No valid layers", showarrow=False)
@@ -1089,13 +1090,23 @@ def generate_res_step_graph_elev(row, row_index, label=None, elevation=None,step
         line=dict(shape='hv', width=3, color=step_color),
         name=label or f"Sounding {row_index}"
     ))
-    # DOI
-    fig.add_hline(
-        y=doi, 
-        line_dash="dash", 
-        line_color=step_color,
-        line_width=2,
-        )
+    # DOI -- checked here, on the FINAL post-transform value, not just the
+    # raw extracted one. A site whose own data contributes ~zero cumulative
+    # sensitivity (e.g. most/all of its gates were manually disabled) used
+    # to make anemone.inversion's calc_doi() divide by zero and return
+    # +-inf as its "depth of investigation" -- fixed at the source in the
+    # anemone package (calc_doi now returns NaN for that case), but this
+    # check stays as defense in depth: passing a non-finite y-coordinate to
+    # add_hline produces a shape Plotly.js can't position correctly and
+    # falls back to rendering it as a diagonal line stretching across the
+    # whole plot, rather than simply not drawing anything.
+    if raw_doi_valid and np.isfinite(doi):
+        fig.add_hline(
+            y=doi,
+            line_dash="dash",
+            line_color=step_color,
+            line_width=2,
+            )
 
     fig.update_layout(
         yaxis=dict(title=y_title, range=y_range, autorange=False),

@@ -23,6 +23,7 @@ class MultiInversion(Panel):
     starting_rho = 10.
     log_time_value = None
     dbdt = None
+    current_instrument_label = None
     def __init__(self, dataframe,rho=10., **kwargs):
         self.starting_rho = rho
         self.title = "Spatially Constrained Inversion"
@@ -89,8 +90,10 @@ class MultiInversion(Panel):
             )
             site_with_median_dbdt = (site_medians - global_median).abs().idxmin()
             df_site = sesh.data[sesh.data['site_id'] == site_with_median_dbdt].dropna(subset=['dbdt'])
-            df_lm = df_site[df_site['system_id'] == 0]
-            df_hm = df_site[df_site['system_id'] == 1]
+            site_instrument = df_site['instrument'].iloc[0] if 'instrument' in df_site.columns else None
+            lm_system_id, hm_system_id = sorted(df_site['system_id'].unique())[:2]
+            df_lm = df_site[df_site['system_id'] == lm_system_id]
+            df_hm = df_site[df_site['system_id'] == hm_system_id]
 
             time_lm = df_lm['time'].values
             time_hm = df_hm['time'].values
@@ -100,7 +103,7 @@ class MultiInversion(Panel):
 
             d_err = sesh.data[sesh.data['site_id']==site_with_median_dbdt].error.dropna().values
             d_obs = sesh.data[sesh.data['site_id']==site_with_median_dbdt].dbdt.dropna().values
-            dbdt = sesh.dmfwr(rho,depth).exp()
+            dbdt = sesh.dmfwr_for(site_instrument)(rho,depth).exp()
             dbdt_lm = dbdt[:len(time_lm)]
             dbdt_hm = dbdt[len(time_lm):len(time_lm)+len(time_hm)]
             e = d_err / 100
@@ -282,7 +285,7 @@ class MultiInversion(Panel):
             self.misfit = []
             from __main__ import sesh
 
-            for line in sesh.inv_status:
+            for line in getattr(sesh, 'inv_status', []):
                 if not line.strip():
                     continue  # skip empty lines
 
@@ -309,6 +312,8 @@ class MultiInversion(Panel):
             timer_text = f"Elapsed time: {int(minutes)}:{int(seconds):02d}"
             if log_time_value is not None:
                 timer_text += f"\nLast iteration: {log_time_value} s"
+            if self.current_instrument_label is not None:
+                timer_text = f"{self.current_instrument_label}\n{timer_text}"
             return self.render(), timer_text
         @app.callback(
             Output("starting_model", "figure"),
@@ -361,11 +366,6 @@ class MultiInversion(Panel):
             if n_clicks:
                 from torch import from_numpy, tensor
                 print('starting model:', starting_model["rho"])
-                rho = tensor(starting_model["rho"]).repeat(len(starting_model["depth"]))
-                # z   = tensor(starting_model["depth"][:-1])
-                depth = self.build_depth_from_loop(time=sesh.data.time.unique()[-1])
-                # rho = tensor(starting_model["rho"]).repeat(len(depth))
-                z   = tensor(depth[:-1])
 
                 if vc_level == "loose":
                     Vert = 2.0
@@ -380,8 +380,35 @@ class MultiInversion(Panel):
                     Horz = 0.3
                 elif hc_level == "tight":
                     Horz = 0.1
-                res_start                        = LogResistivity.smooth(rho,z) 
-                sesh.models, sesh.data, _ = temframe.invert(sesh.data, sesh.dmfwr, res_start,vc = Vert, hc = Horz)
+
+                if 'instrument' in sesh.data.columns:
+                    instruments = sesh.data['instrument'].unique()
+                else:
+                    instruments = [None]
+
+                df_layers_list, df_data_list = [], []
+                for idx, instrument in enumerate(instruments):
+                    if instrument is None:
+                        df_inst = sesh.data
+                        self.current_instrument_label = None
+                    else:
+                        df_inst = sesh.data[sesh.data['instrument'] == instrument]
+                        self.current_instrument_label = f"Inverting {instrument} ({idx+1}/{len(instruments)})"
+
+                    rho = tensor(starting_model["rho"]).repeat(len(starting_model["depth"]))
+                    depth = self.build_depth_from_loop(time=df_inst['time'].max())
+                    z   = tensor(depth[:-1])
+                    res_start = LogResistivity.smooth(rho,z)
+
+                    df_layers_inst, df_data_inst, _ = temframe.invert(
+                        df_inst, sesh.dmfwr_for(instrument), res_start, vc=Vert, hc=Horz
+                    )
+                    df_layers_list.append(df_layers_inst)
+                    df_data_list.append(df_data_inst)
+
+                self.current_instrument_label = None
+                sesh.models = pd.concat(df_layers_list, ignore_index=True)
+                sesh.data = pd.concat(df_data_list, ignore_index=True)
                 sesh.update_site_table()
                 m1.dataframe = sesh.site.copy()
                 self.title = "Inversion Finished"
@@ -608,8 +635,10 @@ class Single_site(Panel):
                 site_with_median_dbdt = (site_medians - global_median).abs().idxmin()
                 df_site = sesh.data[sesh.data['site_id'] == site_with_median_dbdt].dropna(subset=['dbdt'])
 
-                df_lm = df_site[df_site['system_id'] == 0]
-                df_hm = df_site[df_site['system_id'] == 1]
+                site_instrument = df_site['instrument'].iloc[0] if 'instrument' in df_site.columns else None
+                lm_system_id, hm_system_id = sorted(df_site['system_id'].unique())[:2]
+                df_lm = df_site[df_site['system_id'] == lm_system_id]
+                df_hm = df_site[df_site['system_id'] == hm_system_id]
 
                 time_lm = df_lm['time'].values
                 time_hm = df_hm['time'].values
@@ -619,7 +648,7 @@ class Single_site(Panel):
 
                 d_err = sesh.data[sesh.data['site_id']==site_with_median_dbdt].error.dropna().values
                 d_obs = sesh.data[sesh.data['site_id']==site_with_median_dbdt].dbdt.dropna().values
-                dbdt = sesh.dmfwr(rho,depth).exp()
+                dbdt = sesh.dmfwr_for(site_instrument)(rho,depth).exp()
                 dbdt_lm = dbdt[:len(time_lm)]
                 dbdt_hm = dbdt[len(time_lm):len(time_lm)+len(time_hm)]
                 e = d_err / 100
@@ -950,19 +979,22 @@ class Single_site(Panel):
             #     site_id = sesh.data['site_id'].iloc[click_data['points'][0]['pointNumber']]
             # else:
             #     raise PreventUpdate
-            if site_id is None or sesh.data[sesh.data['site_id'] == site_id].empty:
+            site_data = sesh.data[sesh.data['site_id'] == site_id]
+            if site_id is None or site_data.empty:
                 raise PreventUpdate
+            site_instrument = site_data['instrument'].iloc[0] if 'instrument' in site_data.columns else None
+            dmfwr = sesh.dmfwr_for(site_instrument)
             self.curves = []
             print('starting model:', starting_model["rho"])
             rho = tensor(starting_model["rho"]).repeat(len(starting_model["depth"]))
-            depth = self.build_depth_from_loop(time=sesh.data.time.unique()[-1])
+            depth = self.build_depth_from_loop(time=site_data['time'].max())
             z   = tensor(depth[:-1])
 
             for vc in vc_levels:
-                
+
                 Vert = {"loose": 2.0, "medium": 0.8, "tight": 0.2}[vc]
                 res_start = LogResistivity.smooth(rho, z)
-                df_layers, df_site, _ = temframe.invert_site(sesh.data, sesh.dmfwr, site_id=site_id, res_start=res_start, vc=Vert)
+                df_layers, df_site, _ = temframe.invert_site(sesh.data, dmfwr, site_id=site_id, res_start=res_start, vc=Vert)
                 self.curves.append((vc, df_layers['resistivity'].values, df_layers['bottom_depth'].values,df_layers['misfit'].values[-1],df_layers, df_site['dbdt'].values, df_site['dbdt_syn'].values, df_site['time'].values, df_site['error'].values,df_site['include'].values, df_layers['doi'].values))
 
             return self.render()

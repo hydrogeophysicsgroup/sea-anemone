@@ -1,6 +1,91 @@
 from basepanel import *
+from dash import no_update
+from dataclasses import field
 import numpy as np
 import pandas as pd
+
+
+def _no_data_figure(message):
+    """A blank figure with a centered message -- used instead of crashing
+    when a 'line N' radius filter leaves zero rows (e.g. a drawn line with
+    no TEM sites nearby), so the caller can still overlay other content
+    (e.g. nearby boreholes) on top of it."""
+    fig = go.Figure()
+    fig.add_annotation(
+        text=message, xref="paper", yref="paper", x=0.5, y=0.5,
+        showarrow=False, font=dict(size=16, color="gray"),
+    )
+    fig.update_xaxes(visible=False)
+    fig.update_yaxes(visible=False)
+    return fig
+
+
+def _log_colorbar_ticks(vmin, vmax):
+    """
+    Nice round Ωm values (1/2/5 per decade -- 1, 2, 5, 10, 20, 50, ...)
+    between vmin and vmax, for labeling a colorbar whose underlying z data
+    is log10(resistivity) with real resistivity values instead of raw
+    log10 exponents. Returns (tickvals, ticktext): tickvals are each
+    value's log10 position (where it actually falls on the z-axis),
+    ticktext is the value itself formatted for display.
+    """
+    if vmin <= 0 or vmax <= 0 or vmax <= vmin:
+        return [np.log10(max(vmin, 1e-6))], [f"{vmin:g}"]
+    lo = int(np.floor(np.log10(vmin)))
+    hi = int(np.ceil(np.log10(vmax)))
+    values = [
+        mult * 10 ** decade
+        for decade in range(lo, hi + 1)
+        for mult in (1, 2, 5)
+        if vmin <= mult * 10 ** decade <= vmax
+    ]
+    if not values:
+        values = [vmin, vmax]
+    values = sorted(set(values))
+    return [np.log10(v) for v in values], [f"{v:g}" for v in values]
+
+
+def resistivity_colorbar_tick_kwargs(vmin, vmax, log_colorbar):
+    """
+    tickmode/tickvals/ticktext kwargs for a Plotly colorbar whose
+    underlying data is log10(resistivity): real Ωm values at their
+    correct log-spaced positions (see _log_colorbar_ticks) when
+    log_colorbar is False, or {} (Plotly's own auto log10-exponent
+    ticks -- 0, 0.5, 1, ...) when True. Shared by ModelSection's 2D
+    colorbar and Model3D's Mesh3d colorbar so both panels' colorbars
+    tick the same way for the same settings.
+    """
+    if log_colorbar:
+        return {}
+    tick_vals, tick_text = _log_colorbar_ticks(vmin, vmax)
+    return dict(tickmode='array', tickvals=tick_vals, ticktext=tick_text)
+
+
+# Resistivity colorscale (dark blue -> blue -> cyan -> green -> yellow ->
+# orange -> red -> magenta -> purple -> light lavender), low resistivity/
+# conductive = blue, high resistivity/resistive = lavender -- the exact 16
+# RGB triplets from a reference TEM software's "base colors" panel,
+# evenly spaced across the colorscale in the same low-to-high order shown
+# there (that panel lists them high-to-low, top to bottom).
+RESISTIVITY_COLORSCALE = [
+    [0 / 15, 'rgb(0,0,190)'],
+    [1 / 15, 'rgb(0,75,220)'],
+    [2 / 15, 'rgb(0,150,235)'],
+    [3 / 15, 'rgb(0,200,255)'],
+    [4 / 15, 'rgb(80,240,255)'],
+    [5 / 15, 'rgb(30,210,0)'],
+    [6 / 15, 'rgb(180,255,30)'],
+    [7 / 15, 'rgb(255,255,0)'],
+    [8 / 15, 'rgb(255,195,0)'],
+    [9 / 15, 'rgb(255,115,0)'],
+    [10 / 15, 'rgb(255,0,0)'],
+    [11 / 15, 'rgb(255,0,120)'],
+    [12 / 15, 'rgb(140,40,180)'],
+    [13 / 15, 'rgb(165,70,220)'],
+    [14 / 15, 'rgb(195,130,240)'],
+    [15 / 15, 'rgb(230,155,240)'],
+]
+
 
 @nosj
 class ModelGraphSettings(PanelSettings):
@@ -13,13 +98,14 @@ class ModelGraph(Panel):
     highlighted=None
     buffer_len = 50
     buffer_start = 0
+    buffer_sites = None
 
     def __init__(self, **kwargs):
         settings = kwargs.pop('settings', ModelGraphSettings(id='model_graph'))
         super().__init__(id='model_graph', settings=settings)
         for key, value in kwargs.items():
             setattr(self, key, value)
-    
+
     def render(self):
         if self.dataframe is None: return self.empty_render()
         df_layers_long = pd.melt(
@@ -34,16 +120,24 @@ class ModelGraph(Panel):
 
         if self.highlighted is None:
             heatmap_df = df_layers_long.set_index('site_id').sort_index(ascending=True)
-            buffer_start = self.buffer_start
-            buffer_len   = self.buffer_len
 
-            x_values = df_layers_long['site_id'].unique().tolist()
-            n_sites  = len(x_values)
+            if self.buffer_sites is not None:
+                # Explicit site list (e.g. from the Transect view's buffer
+                # window) -- avoids assuming buffer_start/buffer_len are in
+                # site_id units, since the transect x-axis may be in minutes
+                # or meters instead.
+                x_slice = list(self.buffer_sites)
+            else:
+                buffer_start = self.buffer_start
+                buffer_len   = self.buffer_len
 
-            plot_start = max(0, buffer_start)
-            plot_end   = min(n_sites, buffer_start + buffer_len)
+                x_values = df_layers_long['site_id'].unique().tolist()
+                n_sites  = len(x_values)
 
-            x_slice = x_values[plot_start:plot_end]
+                plot_start = max(0, buffer_start)
+                plot_end   = min(n_sites, buffer_start + buffer_len)
+
+                x_slice = x_values[plot_start:plot_end]
 
             fig = px.line(
                 df_layers_long[df_layers_long['site_id'].isin(x_slice)],
@@ -58,19 +152,27 @@ class ModelGraph(Panel):
             )
         else:
             fig = go.Figure(layout=dict(title="1D Resistivity Profile"))
-            df_highlighted = df_layers_long[df_layers_long['site_id'] == self.highlighted]
+            # self.highlighted is a scalar from single-site callbacks
+            # (cross_panel_click, highlight_change) but a list from
+            # multi-select ones (unified_handler) -- this view shows one
+            # profile, so use the first site either way rather than
+            # crashing on `series == a_list`.
+            highlighted = self.highlighted
+            if isinstance(highlighted, (list, tuple, set, np.ndarray, pd.Series)):
+                highlighted = next(iter(highlighted), None)
+            df_highlighted = df_layers_long[df_layers_long['site_id'] == highlighted]
             fig.add_trace(
                 go.Scatter(
                     x=df_highlighted["resistivity"],
                     y=df_highlighted["depth"],
-                    
 
-                    
+
+
                     mode="lines",
                     line=dict(width=2, color='red'),
                     zorder=10,
-                    name=f"Site {self.highlighted}"
-                ), 
+                    name=f"Site {highlighted}"
+                ),
             )
             # fig.add_trace(
             #     go.Scatter(
@@ -95,27 +197,59 @@ class ModelGraph(Panel):
             showline=True,
             mirror=True,
         )
-        return fig        
-    
+        fig.update_layout(showlegend=False)
+        return fig
+
 @nosj
 class ModelSectionSettings(PanelSettings):
-    y_axis: Literal['depth', 'elevation'] = 'depth'
-    x_axis: Literal['daytime', 'site_id'] = 'site_id'
-    bars: bool=True
-    misfit: bool=True
-    doi: bool=True
-    radius : float=100.0
-    vmin: float=1.0
-    vmax: float=500.
-    Min_bar_spacing: float = 0.3
-    Width_factor: float = 10
-    Borehole_radius : float=100.0
+    # Order here drives the order the gear-icon settings form shows them
+    # in (PanelSettings.render() walks the schema properties in
+    # declaration order) -- titles are explicit since the default
+    # fallback is the raw attribute name (e.g. 'Bar_length_width_factor').
+    x_axis: Literal['daytime', 'site_id'] = field(default='site_id', metadata={'title': 'x axis'})
+    y_axis: Literal['depth', 'elevation'] = field(default='elevation', metadata={'title': 'y axis'})
+    vmin: float = field(default=1.0, metadata={'title': 'vmin'})
+    vmax: float = field(default=500., metadata={'title': 'vmax'})
+    bars: bool = field(default=True, metadata={'title': 'Show as bars'})
+    log_colorbar: bool = field(default=False, metadata={'title': 'Log Colorbar'})
+    # ONE factor for every x-axis mode (site_id, daytime, 'line N') and for
+    # boreholes: bar/box half-width = total_length * Bar_length_width_factor
+    # / 2, where total_length is the drawn line's actual total_length in
+    # meters (line mode) or the plotted x-range (site_id/daytime, the
+    # closest analog). Reference cross-sections from other TEM inversion
+    # software size bars off the whole SECTION's length, not local point
+    # density -- a short, sparsely-sampled line's bars stretch out to a
+    # size proportional to its own total length instead of leaving big
+    # blank gaps wherever the nearest neighbor happens to be far away, so
+    # lines of very different lengths still look similarly "full" (see
+    # _bar_width / _local_half_widths). A tight local cluster of points
+    # still gets squeezed below this target (never overlapping) -- see
+    # _local_half_widths -- "if a line is packed with data, they will be
+    # squeezed and that's how it is."
+    # 0.025 (2.5% of section length) calibrated against reference
+    # screenshots from another TEM software (lines ~500 m-4000 m with
+    # ~15-150 m wide bars); tune to taste.
+    Bar_length_width_factor: float = field(default=0.025, metadata={'title': 'Bar Width (% of section length)'})
+    misfit: bool = field(default=True, metadata={'title': 'Misfit'})
+    doi: bool = field(default=True, metadata={'title': 'DOI'})
+    radius: float = field(default=100.0, metadata={'title': 'TEM radius'})
+    Borehole_radius: float = field(default=100.0, metadata={'title': 'Borehole radius'})
 
 
 class ModelSection(Panel):
     highlighted: int = None
     buffer_len = 50
     buffer_start = 0
+    # This panel is the same shared instance on both the QC and Interpret
+    # tabs. On QC it should page through the buffer window like the rest
+    # of that tab, with its x-axis/radius/Borehole_radius controls
+    # hidden; on Interpret it should show every site with those controls
+    # available instead -- see add_callbacks()'s toggle_qc_vs_interpret,
+    # which flips this (and the controls box's visibility) based on which
+    # tab is active. Defaults to the QC behavior, matching the controls
+    # box's own default-hidden state in initialize(), for before the
+    # first tab switch happens.
+    use_buffer = True
     def __init__(self, **kwargs):
         settings = kwargs.pop('settings', ModelSectionSettings(id='model_section'))
         settings.radius=100.
@@ -132,8 +266,6 @@ class ModelSection(Panel):
             line_id = np.unique(sesh.lines.line.values)
             options += [f'line {i:02d}' for i in line_id]
 
-        label_style = {"width": "110px", "textAlign": "right", "fontSize": "14px"}
-
         return  html.Div([
                     html.Div(
                         [
@@ -141,7 +273,15 @@ class ModelSection(Panel):
                         id=self.id,
                         figure=self.render(),
                         mathjax=True,
-                        style={"height": "95%"}
+                        # Less than 100% so there's visible gap above the
+                        # plot, between it and the subtabs (Model section /
+                        # model_section_settings / 3D Model) -- the wrapper
+                        # below is a flex column with justifyContent:
+                        # 'flex-end', so the leftover space collects at the
+                        # TOP instead of the bottom (flexShrink: 0 keeps the
+                        # graph at exactly this height rather than flex
+                        # shrinking it further to fit content).
+                        style={"height": "95%", "flexShrink": 0} #style={"height": "100%"}
                         ),
                         html.Div(
                             [
@@ -151,8 +291,7 @@ class ModelSection(Panel):
                                             "x-axis",
                                             html_for=self.id + "_axis",
                                             class_name="mb-0",
-                                            # style={"width": "70px", "textAlign": "right"},
-                                            style=label_style
+                                            style=FLOATING_BOX_LABEL_STYLE
                                         ),
                                         dbc.Select(
                                             id=self.id + "_axis",
@@ -161,7 +300,7 @@ class ModelSection(Panel):
                                             style={"width": "120px"},
                                         ),
                                     ],
-                                    style={"display": "flex", "alignItems": "center", "gap": "8px"},
+                                    style=FLOATING_BOX_ROW_STYLE,
                                 ),
                                 html.Div(
                                     [
@@ -169,8 +308,7 @@ class ModelSection(Panel):
                                             "radius",
                                             html_for=self.id + "_radius",
                                             class_name="mb-0",
-                                            # style={"width": "70px", "textAlign": "right"},
-                                            style=label_style
+                                            style=FLOATING_BOX_LABEL_STYLE
                                         ),
                                         dbc.Input(
                                             id=self.id + "_radius",
@@ -181,16 +319,15 @@ class ModelSection(Panel):
                                             style={"width": "120px"},
                                         ),
                                     ],
-                                    style={"display": "flex", "alignItems": "center", "gap": "8px"},
+                                    style=FLOATING_BOX_ROW_STYLE,
                                 ),
                                 html.Div(
                                     [
                                         dbc.Label(
-                                            "Borehole_radius",
+                                            "Borehole radius",
                                             html_for=self.id + "_bor_radius",
                                             class_name="mb-0",
-                                            # style={"width": "70px", "textAlign": "right"},
-                                            style=label_style
+                                            style=FLOATING_BOX_LABEL_STYLE
                                         ),
                                         dbc.Input(
                                             id=self.id + "_bor_radius",
@@ -201,27 +338,33 @@ class ModelSection(Panel):
                                             style={"width": "120px"},
                                         ),
                                     ],
-                                    style={"display": "flex", "alignItems": "center", "gap": "8px"},
+                                    style=FLOATING_BOX_ROW_STYLE,
                                 ),
                             ],
-                            style={
-                                "position": "absolute",
-                                "bottom": "12px",
-                                "left": "12px",
-                                "display": "flex",
-                                "flexDirection": "column",
-                                "gap": "8px",
-                                "zIndex": 1000,
-                                "backgroundColor": "rgba(255,255,255,0.85)",
-                                "padding": "6px 8px",
-                                "borderRadius": "6px",
-                            },
+                            id=self.id + '_controls',
+                            # Hidden by default -- shown only on the
+                            # Interpret tab, see add_callbacks()'s
+                            # toggle_qc_vs_interpret. The QC tab shares
+                            # this exact same panel instance but has no
+                            # use for line-mode/radius controls, since it
+                            # always just shows every site by site_id.
+                            style={'display': 'none'},
                         ),
                         ],
-                        style={"position": "relative", "height": "100%"}
+                        # display:flex + justifyContent:'flex-end' pushes
+                        # the graph (see its own height:78% above) to the
+                        # bottom of this box, so the gap from the height
+                        # reduction shows up above the plot instead of
+                        # below it. The '_controls' floating box stays
+                        # anchored to THIS div's own bottom-left corner
+                        # (position:absolute, bottom/left set in
+                        # toggle_qc_vs_interpret) regardless, since this
+                        # div's own size is unchanged -- only the graph's
+                        # position within it moves.
+                        style={"position": "relative", "height": "100%", "display": "flex", "flexDirection": "column", "justifyContent": "flex-end"}
                     ),
                     gear_maker(self.id)],
-                    style={'height': '100%'} 
+                    style={'height': '100%'}
                 )
 
     def project_borehole_to_line(self, bh_x, bh_y, line_x, line_y):
@@ -317,6 +460,15 @@ class ModelSection(Panel):
                 rock  = str(row.get("layer_desc", "")).strip()
                 color = rock_map.get(rock, "lightgray")
 
+                # Purely visual (the colored box + border) -- hover/click
+                # are handled entirely by the marker trace added below.
+                # An earlier version put hoveron='fills' + hovertext here
+                # to make the box's interior hoverable/clickable, but a
+                # 'fills' hit produces a minimal clickData point with no
+                # x/y/data at all (confirmed via a debug clickData dump:
+                # only curveNumber came through), so it can never carry the
+                # bh_id needed to resolve the click, and it also wins the
+                # hit-test over an overlapping marker, blocking that path.
                 fig.add_trace(go.Scatter(
                     x=x_box, y=y_box,
                     fill="toself",
@@ -325,8 +477,49 @@ class ModelSection(Panel):
                     line=dict(width=1, color="black"),
                     name=rock,
                     showlegend=False,
-                    hovertext=f"<b>BH: {bh_id}</b><br>{rock}<br>Depth: {row['layer_top']}-{row['layer_bottom']}m",
-                    hoverinfo="text"
+                    hoverinfo='skip',
+                ))
+
+                # The box's actual hover/click target: a real marker point
+                # has proper x/y/data, unlike a fill-area hit. `meta` is
+                # what compare_popups' alt-click handler resolves against
+                # (clickData.points[0].data.meta -- read via the live graph
+                # element client-side, since points[i].data is unpopulated
+                # in this Plotly build). `customdata` is set too, since
+                # unlike `meta` it IS included in the clickData prop Dash
+                # sends to plain server-side callbacks -- app.py's
+                # cross_panel_click (which highlights the nearest site on
+                # ANY model_section click, alt or not) uses it to recognize
+                # a borehole click and skip highlighting a site for it.
+                # Sized to approximately cover the visible box; being a
+                # circle centered in a rectangular box, corner clicks may
+                # still miss.
+                fig.add_trace(go.Scatter(
+                    x=[bh_x], y=[(z_top + z_bottom) / 2],
+                    mode='markers',
+                    marker=dict(size=30, color='rgba(0,0,0,0)'),
+                    meta=f'BH:{bh_id}',
+                    customdata=[f'BH:{bh_id}'],
+                    # Kept (even with showlegend=False) since Plotly falls
+                    # back to an auto-generated "trace N" for it when
+                    # unset, in places hovertemplate doesn't control (e.g.
+                    # accessibility/ARIA hover labels).
+                    name=rock,
+                    showlegend=False,
+                    # Explicit hovertemplate rather than hoverinfo='text' +
+                    # hovertext -- more reliable for controlling the
+                    # visible hover box content in this Plotly build.
+                    # <extra></extra> suppresses the secondary trace-name
+                    # box. (The real "Hover Unpack Error" console message
+                    # this trace's customdata used to trigger came from
+                    # app.py's sync_hover_to_map, a server-side callback
+                    # that assumed ALL model_section hover customdata was
+                    # the heatmap's [site_id, lat, lon] tuple -- fixed
+                    # there directly, not a hovertemplate issue at all.)
+                    hovertemplate=(
+                        f"<b>BH: {bh_id}</b><br>{rock}<br>"
+                        f"Depth: {row['layer_top']}-{row['layer_bottom']}m<extra></extra>"
+                    ),
                 ))
 
             # Add Borehole ID Label at the top
@@ -339,25 +532,219 @@ class ModelSection(Panel):
             
         return fig
 
+    def _prepare_x_axis(self, df):
+        """
+        Resolve the configured x-axis to a plottable column. site_id is
+        left as-is; daytime is decoded from its `date*100 + decimal_hour`
+        encoding (see temframe._sweeps_to_df: `daytime = date*100 +
+        daytime`, where date is YYYYMMDD) into milliseconds since epoch,
+        matching dbdtSection's transect-view handling, so it renders on a
+        real date axis instead of the raw, nearly-constant composite
+        number. 'line N' resolves to that line's _line_N_x projection
+        column, computed fresh from sesh.models and filtered to sites
+        within settings.radius of the line -- mirrors render()'s own
+        inline line-mode handling (and dbdtSection._prepare_x_axis in
+        panels.py) since callers other than render() (cross_panel_click,
+        compare_popups' alt-click site resolution) need the same
+        resolution but previously got the raw 'line N' string back
+        unresolved, which isn't a real column -> KeyError.
+        """
+        x_axis = self.settings.x_axis
+        if x_axis.startswith('line'):
+            from __main__ import sesh
+            line_id = int(float(x_axis.split(' ')[-1]))
+            line_col = f'_line_{line_id:0.0f}_x'
+            df = sesh.models.copy()
+            df = df.loc[np.abs(df[line_col.replace('_x', '_y')]) < self.settings.radius]
+            return df, line_col
+        if x_axis == 'daytime' and 'daytime' in df.columns:
+            df = df.copy()
+            date_int = np.floor(df['daytime'] / 100).astype('int64')
+            hours    = df['daytime'] - date_int * 100
+            date_df = pd.DataFrame({
+                'year':  date_int // 10000,
+                'month': (date_int // 100) % 100,
+                'day':   date_int % 100,
+            })
+            dt = pd.to_datetime(date_df) + pd.to_timedelta(hours, unit='h')
+            df['_daytime_ms'] = dt.astype('int64') // 10**6
+            return df, '_daytime_ms'
+        return df, x_axis
+
+    # Fallback bar width (meters along the profile) for 'line N' mode
+    # when there's only one (or zero) plotted point AND the line's
+    # total_length itself is unknown -- essentially never happens (line
+    # mode always has total_length from sesh.lines), kept only as a last
+    # resort so a malformed/zero-length line can't divide-by-zero its way
+    # into a zero-width bar.
+    _LINE_BAR_WIDTH_FALLBACK = 5.0
+
+    # Local-neighbor squeeze multiplier used only as an anti-overlap
+    # safety net for tightly-packed points (see _local_half_widths) -- 0.5
+    # means a packed pair squeezes down to exactly touch (half_width =
+    # 0.5 * their gap on each side), never overlapping. Not user-tunable:
+    # it only ever kicks in below the section-length-based target
+    # (Bar_length_width_factor), which is the one setting that actually
+    # controls how bars look in the normal (non-packed) case.
+    _LOCAL_SQUEEZE_FACTOR = 0.5
+
+    def _bar_width(self, df, x_axis, raw_x_axis, total_length=None):
+        """
+        Bar/borehole-box half-width in the same units as the resolved
+        x-axis column -- total_length * Bar_length_width_factor / 2 (see
+        that field), where total_length is the drawn line's actual
+        total_length in meters (line mode, passed in by the caller) or,
+        when not given, this view's own plotted x-range (site_id/daytime,
+        the closest analog to a "section length"). Boreholes use this
+        same scalar (see add_boreholes_to_section_fig's `width` param),
+        so a borehole box is always the same width as a "normal"
+        (non-squeezed) TEM model bar in the same view.
+        """
+        x_sorted = np.sort(df[x_axis].dropna().unique())
+        if total_length is None and len(x_sorted) > 1:
+            total_length = x_sorted[-1] - x_sorted[0]
+        if total_length:
+            return total_length * self.settings.Bar_length_width_factor / 2
+        # No length info at all -- e.g. a single site_id/daytime point, or
+        # (essentially never) a line whose total_length is unknown.
+        if raw_x_axis == 'daytime':
+            return 60_000.0  # 1 minute -- Bar_length_width_factor has nothing to scale against here
+        if raw_x_axis.startswith('line'):
+            return self._LINE_BAR_WIDTH_FALLBACK
+        return 1.0  # site_id's own natural unit is ~1
+
+    def _local_half_widths(self, x_sorted, fallback, total_length=None):
+        """
+        Per-point bar half-width for the bars heatmap (see the 'Show as
+        bars' block in render_base()): normally the section-length-based
+        target (total_length * Bar_length_width_factor / 2 -- see that
+        field and _bar_width), the SAME target every bar in the view
+        shares, so a sparse line's bars stretch out toward a size
+        proportional to the WHOLE section instead of however far its
+        nearest neighbor happens to be -- e.g. a 500 m line and a 4000 m
+        line with similarly-spaced stations end up looking similarly
+        "full" rather than the short line showing tiny slivers with huge
+        gaps.
+
+        Capped, per point, at that point's own LOCAL nearest-neighbor gap
+        (left or right, whichever is smaller) times _LOCAL_SQUEEZE_FACTOR
+        -- so a tight local cluster of sites still squeezes its own bars
+        down to fit without overlapping, while normally-spaced points
+        elsewhere in the same view keep the full section-length target.
+        fallback is used only when total_length is completely unknown AND
+        there's just one point plotted (no neighbor, no length to derive
+        anything from) -- pass the already-computed _bar_width() scalar
+        for that case, same as before.
+        """
+        n = len(x_sorted)
+        if total_length is None and n > 1:
+            total_length = x_sorted[-1] - x_sorted[0]
+        target_half_width = (total_length * self.settings.Bar_length_width_factor / 2
+                              if total_length else None)
+        if n <= 1:
+            return np.full(n, target_half_width if target_half_width is not None else fallback)
+        gaps = np.diff(x_sorted)
+        local_gap = np.empty(n)
+        local_gap[0] = gaps[0]
+        local_gap[-1] = gaps[-1]
+        local_gap[1:-1] = np.minimum(gaps[:-1], gaps[1:])
+        half_widths = local_gap * self._LOCAL_SQUEEZE_FACTOR
+        if target_half_width is not None:
+            half_widths = np.minimum(half_widths, target_half_width)
+        return half_widths
+
+    def _empty_line_figure(self, x_axis):
+        """Axes-only shell for 'line N' mode when there are no TEM models
+        within radius. Mirrors render_base()'s normal axis setup (title,
+        orientation, reversed depth axis) but carries no heatmap trace, so
+        a boreholes-only view (drawn on top by render()) still lines up
+        x-axis wise with the regular TEM section instead of looking like a
+        blank/unrelated plot. render() fills in the x-range (from the
+        line's total length) once it's built; callers fall back to a "no
+        data" message only if no borehole traces end up drawn on it either.
+        """
+        fig = go.Figure()
+        y_axis = self.settings.y_axis
+        if y_axis == 'depth':
+            fig.update_yaxes(autorange='reversed')
+        fig.update_layout(
+            xaxis=dict(title=x_axis.replace('_x', '').replace('_', ' ').strip(), title_standoff=4, type='linear'),
+            yaxis=dict(title=y_axis),
+            plot_bgcolor='white',
+            hovermode='closest',
+            # Keep in sync with render()'s margin=dict(b=...) and both
+            # colorbar y= values in this file -- all sized around the
+            # same horizontal colorbar gap.
+            margin=dict(b=110),
+        )
+        return fig
+
+    def _typical_ylim(self, df):
+        """
+        A DOI-based y-axis range computed from `df` (a models-like
+        dataframe with site_id, top_depth/bottom_depth, doi, elevation,
+        layer columns), using the same logic render() uses for its own
+        y-range. Used as a fallback when a drawn line has no TEM sites in
+        radius, so a boreholes-only view still uses the same vertical
+        scale as a normal TEM section (computed from the full,
+        unfiltered model set) instead of autoranging to fit just the
+        boreholes, which made it look taller/shorter than the regular
+        plots.
+        """
+        if df is None or df.empty:
+            return None
+        df_layers_long = df.melt(
+            id_vars=['site_id', 'doi', 'layer', 'elevation'],
+            value_vars=['top_depth', 'bottom_depth'],
+            var_name='depth_type', value_name='depth')
+        doi_df = df_layers_long.groupby('site_id')['doi'].first().reset_index()
+
+        if self.settings.y_axis == 'elevation':
+            boundary_elevation = df_layers_long['elevation'] - df_layers_long['depth']
+            model_bottom_elev = boundary_elevation.min()
+            doi_df['doi'] = df.groupby('site_id')['elevation'].first().values - doi_df['doi'].values
+            y_bottom = doi_df["doi"].min() - 8
+            if not np.isfinite(y_bottom) or y_bottom >= model_bottom_elev:
+                y_bottom = model_bottom_elev - 8
+            return [y_bottom, df_layers_long["elevation"].max() + 8]
+        else:
+            y_bottom = doi_df["doi"].max() + 8
+            if not np.isfinite(y_bottom) or y_bottom <= df_layers_long["depth"].max():
+                y_bottom = df_layers_long["depth"].max() + 8
+            return [y_bottom, df_layers_long["depth"].min() - 8]
+
     def render_base(self):
 
         if self.dataframe is None: return self.empty_render()
 
         # --- Select dataframe ---
-        x_axis = self.settings.x_axis
+        raw_x_axis = self.settings.x_axis
+        x_axis = raw_x_axis
 
         if x_axis.startswith('line'):
             line_id = int(float(x_axis.split(' ')[-1]))
             x_axis = f'_line_{line_id:0.0f}_x'
 
+        total_length = None
         if 'line' in x_axis:
             from __main__ import sesh
+            total_length = sesh.lines[sesh.lines.line == line_id].total_length.max()
             df = sesh.models.copy()
             df = df.loc[np.abs(df[x_axis.replace('_x', '_y')]) < self.settings.radius]
-            width = self.settings.Min_bar_spacing * self.settings.Width_factor
+            if df.empty:
+                # No inverted sites within the drawn line's radius -- render()
+                # still needs a valid figure to overlay boreholes onto (with
+                # the same axis setup a normal render would have, so a
+                # boreholes-only view lines up with the regular TEM section),
+                # rather than a crash from the empty-pivot/empty-array math
+                # below. It falls back to a "no data" message itself only if
+                # no boreholes turn out to be nearby either.
+                return self._empty_line_figure(x_axis)
+            width = self._bar_width(df, x_axis, raw_x_axis, total_length=total_length)
         else:
             df = self.dataframe.copy()
-            width = self.settings.Min_bar_spacing 
+            df, x_axis = self._prepare_x_axis(df)
+            width = self._bar_width(df, x_axis, raw_x_axis)
 
         # --- Clean + stabilize ---
         df = df.copy()
@@ -373,7 +760,23 @@ class ModelSection(Panel):
         x = pivot.index.values
         depth = pivot.columns.values.squeeze()
 
-        
+        # A layer is "below DOI" once any part of it (its bottom edge) has
+        # crossed the site's depth of investigation -- from that layer down
+        # it's unreliable, so it gets drawn transparently (see below) rather
+        # than the old smooth polygon overlay, which only followed one
+        # boundary line interpolated between site x-positions and couldn't
+        # reflect a per-layer/per-site DOI crossing. Computed here (before
+        # the y-axis remap) in plain depth units, same units 'doi' is in
+        # regardless of whether the display axis is depth or elevation.
+        if self.settings.doi and 'doi' in df.columns and 'bottom_depth' in df.columns:
+            bottom_pivot = df.pivot_table(
+                values='bottom_depth', index=x_axis, columns='center_depth',
+                aggfunc='first').reindex(index=pivot.index, columns=pivot.columns)
+            doi_by_site = df.groupby(x_axis)['doi'].first().reindex(pivot.index).values
+            below_doi_orig = bottom_pivot.values >= doi_by_site[:, None]
+        else:
+            below_doi_orig = None
+
         if y_axis == 'depth':
             # FAKE flat elevation
             elev = np.zeros(len(pivot.index))
@@ -383,12 +786,21 @@ class ModelSection(Panel):
             elev_axis = np.arange(d_elev) + center_elev.min() - 25
 
             dist = np.abs(elev_axis[:, None, None] - center_elev[None, :, :])
+            # Sites can have different depth discretizations (e.g. different
+            # instruments), so `depth` is the union of every site's layer
+            # boundaries -- most columns are NaN for any given site. Restrict
+            # the nearest-neighbor search to that site's own valid columns,
+            # otherwise it can snap to a numerically-closer but foreign (NaN)
+            # column and punch holes in that site's profile.
+            valid = ~np.isnan(pivot.values)
+            dist = np.where(valid[None, :, :], dist, np.inf)
             nearest_idx = dist.argmin(axis=-1)
 
             n_elev, n_sites = nearest_idx.shape
             station_idx = np.broadcast_to(np.arange(n_sites), (n_elev, n_sites))
 
             res_grid = pivot.values[station_idx, nearest_idx]
+            below_doi_grid = below_doi_orig[station_idx, nearest_idx] if below_doi_orig is not None else None
 
             # mask air / below model
             heaven = elev_axis[:, None] > elev[None, :]
@@ -397,7 +809,7 @@ class ModelSection(Panel):
             res_grid[heaven] = np.nan
             res_grid[hell]   = np.nan
 
-            y = -elev_axis 
+            y = -elev_axis
 
             # y = depth
             # res_grid = pivot.values.T  # (depth, site)
@@ -413,12 +825,17 @@ class ModelSection(Panel):
             elev_axis = np.arange(d_elev) + center_elev.min() - 25
 
             dist = np.abs(elev_axis[:, None, None] - center_elev[None, :, :])
+            # See comment in the 'depth' branch above: restrict the search to
+            # each site's own valid (non-NaN) depth columns.
+            valid = ~np.isnan(pivot.values)
+            dist = np.where(valid[None, :, :], dist, np.inf)
             nearest_idx = dist.argmin(axis=-1)
 
             n_elev, n_sites = nearest_idx.shape
             station_idx = np.broadcast_to(np.arange(n_sites), (n_elev, n_sites))
 
             res_grid = pivot.values[station_idx, nearest_idx]
+            below_doi_grid = below_doi_orig[station_idx, nearest_idx] if below_doi_orig is not None else None
 
             # mask air / below model
             heaven = elev_axis[:, None] > elev[None, :]
@@ -432,96 +849,201 @@ class ModelSection(Panel):
         else:
             raise ValueError(f"Unknown y_axis: {y_axis}")
 
+        if below_doi_grid is not None:
+            res_grid_above = np.where(below_doi_grid, np.nan, res_grid)
+            res_grid_below = np.where(below_doi_grid, res_grid, np.nan)
+        else:
+            res_grid_above = res_grid
+            res_grid_below = None
+
         id_map = df.groupby(x_axis)[['site_id', 'latitude', 'longitude']].first()
         site_info = id_map.reindex(pivot.index)[['site_id', 'latitude', 'longitude']].values
-        
+
         if self.settings.bars:
-            
+
             n_sites = len(x)
             n_depths = res_grid.shape[0]
 
+            # Per-point half-width (see _local_half_widths) rather than
+            # the single `width` scalar for every bar -- `width` (from
+            # _bar_width, the view's overall median spacing) is still
+            # used as the single-point fallback and for boreholes/the
+            # highlight rect below, where a per-site value doesn't apply.
+            half_widths = self._local_half_widths(x, fallback=width, total_length=total_length)
+
             # Use 4 points per site: [Left_Gap, Left_Edge, Right_Edge, Right_Gap]
             x_plot = np.zeros(n_sites * 4)
-            res_new = np.full((n_depths, n_sites * 4), np.nan)
 
             for i in range(n_sites):
                 idx = 4 * i
                 center_x = x[i]
-                
+                w = half_widths[i]
+
                 # 1. Coordinate slightly left of the bar (NaN)
-                x_plot[idx]     = center_x - width - 0.0001
+                x_plot[idx]     = center_x - w - 0.0001
                 # 2. Left edge of bar
-                x_plot[idx + 1] = center_x - width
+                x_plot[idx + 1] = center_x - w
                 # 3. Right edge of bar
-                x_plot[idx + 2] = center_x + width
+                x_plot[idx + 2] = center_x + w
                 # 4. Coordinate slightly right of the bar (NaN)
-                x_plot[idx + 3] = center_x + width + 0.0001
-                
-                # Assign values only to the edges (idx+1 and idx+2)
-                # This creates a solid block of color between them
-                res_new[:, idx + 1] = res_grid[:, i]
-                res_new[:, idx + 2] = res_grid[:, i]
+                x_plot[idx + 3] = center_x + w + 0.0001
+
+            def _expand_bars(grid):
+                # Assign values only to the bar edges (idx+1 and idx+2) --
+                # this creates a solid block of color between them.
+                grid_new = np.full((n_depths, n_sites * 4), np.nan)
+                for i in range(n_sites):
+                    idx = 4 * i
+                    grid_new[:, idx + 1] = grid[:, i]
+                    grid_new[:, idx + 2] = grid[:, i]
+                return grid_new
 
             x_final = x_plot
-            res_grid_final = res_new
+            res_grid_final = _expand_bars(res_grid_above)
+            res_grid_below_final = _expand_bars(res_grid_below) if res_grid_below is not None else None
 
             # for the hovermarker
             site_info_expanded = np.repeat(site_info, 4, axis=0)
             custom_data_grid = np.tile(site_info_expanded, (len(y), 1, 1))
         else:
             x_final = x
-            print("x final 2", x_final)
-            res_grid_final = res_grid
+            res_grid_final = res_grid_above
+            res_grid_below_final = res_grid_below
 
             custom_data_grid = np.tile(site_info, (len(y), 1, 1))
 
+        # Append each cell's actual (non-log) resistivity as a 4th
+        # customdata column, aligned with res_grid_final -- lets the main
+        # heatmap trace's hovertemplate show a Res value per bar, the same
+        # way hovering a borehole box shows its lithology (see
+        # add_boreholes_to_section_fig above).
+        custom_data_grid = np.concatenate(
+            [custom_data_grid, res_grid_final[:, :, None]], axis=-1)
+
         # Final Plotting using Graph Objects for precision
         import plotly.graph_objects as go
-                
-        fig = go.Figure(data=go.Heatmap(
-            z=np.log10(res_grid_final),
+
+        # The z data/color mapping is ALWAYS log10(resistivity) -- that
+        # part never changes. log_colorbar (default off) only changes how
+        # the colorbar's ticks are LABELED: off shows real Ωm values (at
+        # their correct log-spaced positions, via _log_colorbar_ticks), on
+        # shows the raw log10 exponent Plotly would auto-tick otherwise
+        # (0, 0.5, 1, ...). Keep colorbar_kwargs in sync with the
+        # boreholes-only dummy colorbar below, which mirrors this same
+        # geometry/labeling so automargin reserves the same space either way.
+        zmin, zmax = np.log10(self.settings.vmin), np.log10(self.settings.vmax)
+        title_text = "Resistivity [log10 Ωm]" if self.settings.log_colorbar else "Resistivity [Ωm]"
+        colorbar_kwargs = dict(
+            title=dict(text=title_text, side="bottom"),
+            **resistivity_colorbar_tick_kwargs(self.settings.vmin, self.settings.vmax, self.settings.log_colorbar),
+        )
+
+        heatmap_kwargs = dict(
             x=x_final,
             y=y,
             customdata=custom_data_grid,
-            hovertemplate="Site: %{customdata[0]}<extra></extra>",
             zsmooth=False,
             hoverongaps=False,
-            colorscale='turbo',
-            zmin=np.log10(self.settings.vmin),
-            zmax=np.log10(self.settings.vmax),
-            # colorbar=dict(title='Resistivity [Ω·m]')
+            colorscale=RESISTIVITY_COLORSCALE,
+            zmin=zmin,
+            zmax=zmax,
+        )
+
+        y_label = 'Elevation' if y_axis == 'elevation' else 'Depth'
+        fig = go.Figure(data=go.Heatmap(
+            z=np.log10(res_grid_final),
+            hovertemplate=(
+                f"Site: %{{customdata[0]}}<br>{y_label}: %{{y:.1f}} m<br>"
+                "Resistivity: %{customdata[3]:.1f} Ωm<extra></extra>"
+            ),
             colorbar=dict(
                 orientation="h",
-                y=-0.75,        # Adjusted to move it below the X-axis title
+                # In paper-fraction units (a % of the whole figure's
+                # height), not axis-relative -- keep in sync with the
+                # dummy colorbar below and both margin=dict(b=...) calls
+                # in this file, which all assume the same gap.
+                y=-0.45,
                 x=0.5,
                 xanchor="center",
                 len=0.5,
                 thickness=15,
-                title=dict(text="Resistivity [log10 Ωm]", side="bottom"))
+                **colorbar_kwargs),
+            **heatmap_kwargs
+        ))
+
+        if res_grid_below_final is not None:
+            fig.add_trace(go.Heatmap(
+                z=np.log10(res_grid_below_final),
+                opacity=0.35,
+                showscale=False,
+                hoverinfo='skip',
+                name='Below DOI',
+                **heatmap_kwargs
+            ))
+
+        # Heatmap traces don't support Plotly's box/lasso select at all --
+        # only scatter-like traces with discrete markers do -- so a drawn
+        # selection box over the heatmap alone never produces any
+        # selectedData, and app.py's unified_handler (which syncs a
+        # selection here to Sounding/Model Graph) never fires. An
+        # invisible column of markers per site, spanning the full y-range,
+        # gives box-select something real to hit -- same trick used for
+        # borehole hit-testing elsewhere in this app. customdata[0] is the
+        # site_id, matching what unified_handler reads.
+        n_select_rows = 15
+        y_select = np.linspace(y.min(), y.max(), n_select_rows)
+        select_customdata = np.repeat(site_info, n_select_rows, axis=0)
+        fig.add_trace(go.Scatter(
+            x=np.repeat(x, n_select_rows),
+            y=np.tile(y_select, len(x)),
+            mode='markers',
+            marker=dict(size=14, color='rgba(0,0,0,0)'),
+            customdata=select_customdata,
+            hoverinfo='skip',
+            showlegend=False,
+            name='select-targets',
         ))
 
         if y_axis == 'depth':
             fig.update_yaxes(autorange="reversed")
 
-        pad = self.settings.Min_bar_spacing * 2
-        
         # Filter out NaNs to find the real min/max for the range
         valid_x = x_final[~np.isnan(x_final)]
         x_min, x_max = np.min(valid_x), np.max(valid_x)
 
         # 3. Update Layout
+        xaxis_kwargs = dict(
+            title=('Daytime' if raw_x_axis == 'daytime' else x_axis.replace('_x', '').replace('_', ' ').strip()),
+            range=[x_min, x_max], # Forces the first bar to show fully
+            title_standoff=4
+        )
+        if raw_x_axis == 'daytime':
+            # _daytime_ms is milliseconds since epoch (see _prepare_x_axis)
+            # -- render it on a real date axis instead of a raw number,
+            # same scheme as dbdtSection's transect view.
+            day_ms = 1000 * 60 * 60 * 24
+            xaxis_kwargs.update(
+                type='date',
+                tickformatstops=[
+                    dict(dtickrange=[None, day_ms], value='%H:%M:%S'),
+                    dict(dtickrange=[day_ms, None], value='%Y-%m-%d %H:%M'),
+                ],
+            )
+        else:
+            xaxis_kwargs['type'] = 'linear'
+
         fig.update_layout(
-            xaxis=dict(
-                type='linear', 
-                title=x_axis.replace('_x', '').replace('_', ' ').strip(),
-                range=[x_min, x_max], # Forces the first bar to show fully
-                title_standoff=4
-            ),
+            xaxis=xaxis_kwargs,
             yaxis=dict(title=y_axis),
             plot_bgcolor='white',
             # hovermode="x",
             hovermode="closest",
-            margin=dict(b=100) # Add bottom margin to make room for horizontal colorbar
+            margin=dict(b=110), # Bottom margin for the horizontal colorbar -- keep in sync with render_base()'s and the y=-0.45 colorbar positions above
+            # Box select active by default, same as Sounding/Apparent
+            # res/Transect view, so selecting sites here to sync with
+            # those panels (and Model Graph) doesn't require first
+            # clicking the modebar's select tool.
+            dragmode='select',
         )
 
         return fig
@@ -532,42 +1054,105 @@ class ModelSection(Panel):
         fig = self.render_base()
 
         df = self.dataframe.copy()
-        x_axis = self.settings.x_axis
+        raw_x_axis = self.settings.x_axis
+        x_axis = raw_x_axis
         if x_axis.startswith('line'):
             line_id = int(float(x_axis.split(' ')[-1]))
             x_axis = f'_line_{line_id:0.0f}_x'
-        
-        line_coords_utm = None 
-        
+
+        line_coords_utm = None
+
         if 'line' in x_axis:
             from __main__ import sesh
             df = sesh.models.copy()
-            df = df.loc[np.abs(df[x_axis.replace('_x', '_y')])<self.settings.radius]        
+            df = df.loc[np.abs(df[x_axis.replace('_x', '_y')])<self.settings.radius]
             x_min = 0
             x_max = sesh.lines[sesh.lines.line==line_id].total_length.max()
-            current_width = self.settings.Min_bar_spacing * self.settings.Width_factor
+            current_width = self._bar_width(df, x_axis, raw_x_axis, total_length=x_max)
 
             # Filter the line from session
-            c_line = sesh.lines.loc[sesh.lines.line == line_id] 
-            
+            c_line = sesh.lines.loc[sesh.lines.line == line_id]
+
             if not c_line.empty:
                 from pyproj import Transformer
                 epsg = self.get_utm_epsg(c_line.latitude.iloc[0], c_line.longitude.iloc[0])
-                
+
                 transformer = Transformer.from_crs("epsg:4326", f"epsg:{epsg}", always_xy=True)
                 utmx, utmy = transformer.transform(c_line.longitude.values, c_line.latitude.values)
-                
+
                 line_coords_utm = (utmx, utmy)
         else:
-            current_width = self.settings.Min_bar_spacing
+            # Match render_base()'s decoding (daytime -> milliseconds since
+            # epoch) so the overlaid misfit/DOI/highlight traces below line
+            # up with the heatmap's x positions.
+            df, x_axis = self._prepare_x_axis(df)
+            current_width = self._bar_width(df, x_axis, raw_x_axis)
             x_min = None
             x_max = None
 
         from __main__ import sesh
+        n_traces_before_boreholes = len(fig.data)
         if sesh.boreholes is not None and not sesh.boreholes.empty:
            fig = self.add_boreholes_to_section_fig(fig, sesh.boreholes, sesh.rock_map, x_axis,current_width,
                 line_utm=line_coords_utm)
+        boreholes_drawn = len(fig.data) > n_traces_before_boreholes
 
+        if df.empty:
+            # No inverted sites within the drawn line's radius --
+            # render_base() already returned the axes-only shell (with
+            # boreholes now drawn on top of it, if any were nearby); the
+            # misfit/DOI/highlight overlays below all assume non-empty
+            # data, so there's nothing more to add. Still apply the same
+            # x-range the full case uses below, so a boreholes-only view
+            # isn't left on Plotly's default autorange.
+            if x_min is not None and x_max is not None:
+                fig.update_xaxes(range=[x_min, x_max], autorange=False)
+            if not boreholes_drawn:
+                # Neither TEM models nor boreholes are in the search
+                # radius -- nothing to show at all.
+                fig.add_annotation(
+                    text="No TEM models and Boreholes in the search radius",
+                    xref="paper", yref="paper", x=0.5, y=0.5,
+                    showarrow=False, font=dict(size=16, color="gray"),
+                )
+                fig.update_xaxes(visible=False)
+                fig.update_yaxes(visible=False)
+            else:
+                # Boreholes-only: match the same DOI-based y-scale a
+                # normal TEM section uses, rather than leaving the axis
+                # autoranged to just the boreholes' own depths.
+                ylim = self._typical_ylim(sesh.models)
+                if ylim is not None:
+                    fig.update_yaxes(range=ylim, autorange=False)
+                # A normal render's heatmap colorbar (horizontal, anchored
+                # at y=-0.45) makes Plotly's automargin reserve extra
+                # bottom space beyond the plain margin=dict(b=110) both
+                # figures share -- without it, this boreholes-only figure
+                # ends up visibly taller (its plot area expands to fill
+                # the space the colorbar would have used). A dummy trace
+                # with the same colorbar geometry (thickness/length/font
+                # sizes -- what automargin actually sizes around) reserves
+                # that same space, but is made fully transparent (colors,
+                # tick labels and title all rgba(0,0,0,0)) rather than
+                # visible, since there's no resistivity data here for a
+                # colorbar to legitimately represent.
+                fig.add_trace(go.Scatter(
+                    x=[None], y=[None], mode='markers',
+                    marker=dict(
+                        size=0, opacity=0,
+                        colorscale=[[0, 'rgba(0,0,0,0)'], [1, 'rgba(0,0,0,0)']],
+                        cmin=0, cmax=1,
+                        color=[0], showscale=True,
+                        colorbar=dict(
+                            orientation="h", y=-0.45, x=0.5, xanchor="center",
+                            len=0.5, thickness=15, outlinewidth=0,
+                            tickfont=dict(color='rgba(0,0,0,0)'),
+                            title=dict(text="Resistivity [log10 Ωm]" if self.settings.log_colorbar else "Resistivity [Ωm]",
+                                       side="bottom", font=dict(color='rgba(0,0,0,0)'))),
+                    ),
+                    showlegend=False, hoverinfo='skip',
+                ))
+            return fig
 
         df_layers_long = df.melt(
             id_vars=[x_axis, 'resistivity', 'misfit','doi', 'layer', 'elevation'],
@@ -602,72 +1187,107 @@ class ModelSection(Panel):
 
             fig.update_layout(yaxis2=dict(title=dict(text="Misfit",standoff=10),overlaying="y",side="right",showgrid=False))
         
-        doi_df = (df_layers_long.groupby(x_axis)["doi"].first().reset_index())        
+        doi_df = (df_layers_long.groupby(x_axis)["doi"].first().reset_index())
 
         if self.settings.y_axis=='elevation':
+            # df_layers_long['elevation'] is each site's constant SURFACE
+            # elevation (an id_var carried through the melt unchanged, not
+            # a per-layer value) -- using its min() as the deep-end
+            # fallback only captured the shallowest site's surface, not
+            # how deep any model actually goes, which is what was
+            # producing a near-zero-height y-range whenever the doi-based
+            # value got rejected below. The real per-boundary elevation is
+            # elevation - depth (top_depth/bottom_depth from the melt).
+            boundary_elevation = df_layers_long['elevation'] - df_layers_long['depth']
+            model_bottom_elev = boundary_elevation.min()
+
             doi_df['doi'] = df.groupby(x_axis)['elevation'].first().values - doi_df['doi'].values
-            ylim = [doi_df["doi"].min()-8, df_layers_long["elevation"].max()+8]
+            y_bottom = doi_df["doi"].min() - 8
+            # doi should be at or below the deepest (lowest-elevation) actual
+            # layer boundary; if it isn't (e.g. a bad/misaligned doi value --
+            # see temframe.invert's `doi[::2]` slicing, which assumes a fixed
+            # doi-count-to-site-count ratio that per-instrument inversion
+            # runs can violate), fall back to the real layer extent instead
+            # of silently producing a degenerate (non-inverted) axis.
+            if not np.isfinite(y_bottom) or y_bottom >= model_bottom_elev:
+                y_bottom = model_bottom_elev - 8
+            ylim = [y_bottom, df_layers_long["elevation"].max()+8]
         else:
-            ylim = [doi_df["doi"].max()+8, df_layers_long["depth"].min()-8]
+            y_bottom = doi_df["doi"].max() + 8
+            if not np.isfinite(y_bottom) or y_bottom <= df_layers_long["depth"].max():
+                y_bottom = df_layers_long["depth"].max() + 8
+            ylim = [y_bottom, df_layers_long["depth"].min()-8]
         
-        if x_min is None:
-            x_min = df_layers_long[x_axis].min()
-        if x_max is None:
-            x_max = df_layers_long[x_axis].max()
-
-        if self.settings.doi:    
-            if not doi_df.empty:
-
-                y_max = df_layers_long["depth"].max()
-
-                fig.add_trace(
-                    go.Scatter(
-                        x=np.concatenate([
-                            [x_min],
-                            doi_df[x_axis].values,
-                            [x_max],
-                            [x_min]
-                        ]),
-                        y=np.concatenate([
-                            [y_max + 50],
-                            doi_df["doi"].values,
-                            [y_max + 50],
-                            [y_max + 50]
-                        ]),
-                        
-
-
-                        fill="toself",
-                        fillcolor="rgba(255,255,255,0.6)",
-                        line=dict(width=0),
-                        name="Below DOI",
-                    )
-                )
-
-            if self.highlighted is not None and self.dataframe is not None:
-
-                selected_df = df[df["site_id"] == self.highlighted]
-
-                if not selected_df.empty:
-                    x_value = selected_df[x_axis].iloc[0]
-
-                    x_vals = np.sort(df[x_axis].dropna().unique())
-
-                    if len(x_vals) > 1:
-                        diffs = np.diff(x_vals)
-                        dx = np.median(diffs) * 0.5
+        if x_min is None and x_max is None:
+            x_vals = np.sort(df_layers_long[x_axis].dropna().unique())
+            if len(x_vals) > 0:
+                if self.use_buffer:
+                    # Zoom into the buffer window, same as dbdtSection, so
+                    # this panel stays in sync when paging the buffer.
+                    # Falls back to the full range if the window doesn't
+                    # overlap any data at all (e.g. its default
+                    # site-id-scale value landing on a daytime-scale axis).
+                    x_slice = x_vals[(x_vals >= self.buffer_start) & (x_vals <= self.buffer_start + self.buffer_len)]
+                    if len(x_slice) > 0:
+                        x_min, x_max = x_slice.min(), x_slice.max()
                     else:
-                        dx = 0.5
+                        x_min, x_max = x_vals.min(), x_vals.max()
+                else:
+                    # Interpret tab: always show every site, unbuffered.
+                    x_min, x_max = x_vals.min(), x_vals.max()
+            else:
+                x_min, x_max = 0, 1
 
-                    fig.add_shape(
-                        type="rect",
-                        x0=x_value - dx,
-                        x1=x_value + dx,
-                        y0=df_layers_long["depth"].min(),
-                        y1=df_layers_long["depth"].max()+20,
-                        line=dict(color="black", width=1.5),
-                        fillcolor="rgba(0,0,0,0.0)",
-                    )
+        # The below-DOI fade itself is drawn per-layer inside
+        # render_base() (a second, semi-transparent Heatmap trace), since
+        # a per-site/per-layer fade can't be expressed as one smooth
+        # polygon interpolated between site x-positions. doi_df above is
+        # still needed for ylim.
+        #
+        # Black-boundary highlight rect(s) for the currently selected
+        # site(s) -- moved out from under `if self.settings.doi:` (which
+        # only ever gated the now-elsewhere below-DOI fade) since
+        # highlighting shouldn't silently stop working just because the
+        # DOI setting is off. self.highlighted is a scalar from
+        # single-site callbacks (cross_panel_click, highlight_change) but
+        # a list/set from multi-select ones (unified_handler) -- draw one
+        # rect per selected site either way.
+        if self.highlighted is not None and self.dataframe is not None:
+            highlighted = self.highlighted
+            if isinstance(highlighted, (list, tuple, set, np.ndarray, pd.Series)):
+                highlighted_ids = list(highlighted)
+            else:
+                highlighted_ids = [highlighted]
+
+            x_vals = np.sort(df[x_axis].dropna().unique())
+            if len(x_vals) > 1:
+                diffs = np.diff(x_vals)
+                dx = np.median(diffs) * 0.5
+            else:
+                dx = 0.5
+
+            for site_id in highlighted_ids:
+                selected_df = df[df["site_id"] == site_id]
+                if selected_df.empty:
+                    continue
+                x_value = selected_df[x_axis].iloc[0]
+                fig.add_shape(
+                    type="rect",
+                    x0=x_value - dx,
+                    x1=x_value + dx,
+                    # Spans the actual visible y-range (ylim, computed
+                    # above -- elevation-scale when y_axis=='elevation',
+                    # depth-scale otherwise), not raw depth unconditionally.
+                    # Elevation values (site surface elevation minus depth)
+                    # live on a completely different scale than plain
+                    # depth, so a hardcoded depth-based rect landed
+                    # entirely outside the visible range and never showed
+                    # up whenever y_axis was 'elevation' (the default).
+                    y0=min(ylim),
+                    y1=max(ylim),
+                    line=dict(color="black", width=1.5),
+                    fillcolor="rgba(0,0,0,0.0)",
+                )
 
         fig.update_xaxes(range=[x_min, x_max], autorange=False)
         fig.update_yaxes(range=ylim, autorange=False)
@@ -764,3 +1384,28 @@ class ModelSection(Panel):
         def update_Borehole_radius(Borehole_radius):
             self.settings.Borehole_radius=Borehole_radius
             return Borehole_radius
+
+        @app.callback(
+            Output(self.id + '_controls', 'style'),
+            Output(self.id + '_axis', 'value'),
+            self.output,
+            Input('interpret_layout', 'color'),
+            prevent_initial_call=True
+        )
+        def toggle_qc_vs_interpret(color):
+            # This panel is shared between the QC and Interpret tabs. On
+            # QC there's no use for line-mode/radius controls (it always
+            # just shows every site by site_id), so hide them, force back
+            # to that view, and page it via the buffer like the rest of
+            # the QC tab does; on Interpret, show the controls instead and
+            # always show every site (paging doesn't apply there).
+            is_interpret = (color == 'primary')
+            self.use_buffer = not is_interpret
+            if not is_interpret:
+                self.settings.x_axis = 'site_id'
+                controls_style = {'display': 'none'}
+                axis_dropdown_value = 'site_id'
+            else:
+                controls_style = {**FLOATING_BOX_STYLE, 'bottom': '12px', 'left': '12px'}
+                axis_dropdown_value = no_update
+            return controls_style, axis_dropdown_value, self.render()

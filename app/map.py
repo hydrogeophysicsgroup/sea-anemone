@@ -1,4 +1,5 @@
 from basepanel import *
+import time
 import plotly.io as pio
 from typing import Literal
 import plotly.express as px
@@ -7,7 +8,9 @@ from dash import dash_table, ctx, no_update, Patch
 import numpy as np
 from nosj import nosj
 import utm
+import pandas as pd
 from pandas import DataFrame
+from dataclasses import field
 
 
 line_colors = [
@@ -264,35 +267,98 @@ class Grid:
     def graph_object(self, z_data, **kwargs):
         z_mesh = self.grid_values(z_data)
         opacity = kwargs.pop('opacity', 1)
+        showlegend = kwargs.pop('showlegend', True)
         return go.Choroplethmap(
             geojson=self.geojson,
             locations=self.ids,
             z=z_mesh,
-            showlegend=True,
+            showlegend=showlegend,
             marker=dict(opacity=opacity, line=dict(width=0, color=None)),
             showscale=True,
             hoverinfo="skip",
             selectedpoints=[],
-            unselected=dict(marker=dict(opacity=opacity)),            
+            unselected=dict(marker=dict(opacity=opacity)),
             **kwargs
         )
 
 
+PLOT_BY_LABELS = {
+    'none': 'From Import',
+    'enabled_disabled': 'Enabled/Disabled',
+    'misfit': 'Misfit',
+    'doi': 'DOI',
+    'date': 'Date',
+}
+
+PLOT_BY_COLORBAR_TITLES = {
+    'misfit': 'Misfit',
+    'doi': 'DOI [m]',
+}
+
+
+# Shared horizontal placement for every colorbar on this map (plot_by's
+# misfit/doi/date coloraxis colorbar, and mean res's own colorbar) plus
+# their add_colorbar_title() labels, so they always move together. Shifted
+# toward the right and shortened from a near-full-width bar so there's
+# real room on the left for the title text -- at the old x=0.5/len=0.75 the
+# bar's own left edge sat at x=0.125, leaving almost no space and clipping
+# longer titles like "Resistivity [log10 Ωm]".
+COLORBAR_X = 0.55
+COLORBAR_LEN = 0.65
+
+
+def add_colorbar_title(fig, text, bar_x=COLORBAR_X, bar_len=COLORBAR_LEN, bar_y=-0.01, bar_thickness=10):
+    """
+    Plotly colorbar titles only support top/right/bottom placement (no
+    'left') -- fake a left-of-bar title with a plain annotation positioned
+    just outside the bar's left edge, matching the horizontal colorbar
+    layout used throughout this file (x/len/y/thickness kept in sync with
+    it). The bar itself is yanchor='top' at bar_y (its top edge sits
+    there, extending down by bar_thickness px) -- match that anchor and
+    nudge down by half the thickness so the label lines up with the
+    vertical center of the bar rather than its top edge.
+    """
+    if not text:
+        return
+    fig.add_annotation(
+        text=text, x=bar_x - bar_len / 2, y=bar_y, xref='paper', yref='paper',
+        xanchor='right', yanchor='top', xshift=-8, yshift=-bar_thickness / 2,
+        showarrow=False,
+        font=dict(size=14, color='black'),
+    )
+
+
 @nosj
 class MapSettings(PanelSettings):
+    # zoom/view are internal viewport state (view in particular is a dict,
+    # which the generic settings-form text Input can't round-trip safely
+    # -- see the hidden_settings docstring in basepanel.py), and legend
+    # isn't meaningful as a standalone toggle here. mean_res and dragmode
+    # already have their own dedicated controls (the "Mean res depth"
+    # select in the panel body, and the map's own drag-mode toolbar
+    # buttons) so a second copy in the gear form is just clutter. Excluded
+    # from the gear-icon settings form; still fully functional as plain
+    # attributes.
+    hidden_settings = {'zoom', 'view', 'legend', 'mean_res', 'dragmode'}
+    enum_labels = {'plot_by': PLOT_BY_LABELS}
+
+    plot_by: Literal['none', 'enabled_disabled', 'misfit', 'doi', 'date'] = field(
+        default='none', metadata={'title': 'Plot by'})
+    mean_res: int = field(default=-1, metadata={'title': 'Mean res depth'})
+    markersize: int = field(default=14, metadata={'title': 'Data points size'})
+    line_width: int = field(default=3, metadata={'title': 'Line width'})
+    dragmode: str = field(default='select', metadata={'title': 'Map mode'})
+    color: str = field(default='#ff0000', metadata={'title': 'Data points default color'})
+    # Matches the orange used app-wide for the cross-panel selection
+    # highlight (see unified_handler in app.py).
+    highlight_color: str = field(default='#ffb835', metadata={'title': 'Highlight color'})
+    buffer_color: str = field(default='#ffffff', metadata={'title': 'Buffer color'})
+    Borehole_markersize: int = field(default=12, metadata={'title': 'Borehole point size'})
+    Borehole_color: str = field(default='#00e1ff', metadata={'title': 'Borehole color'})
+
     zoom: int = 10
-    color: str = '#ff0000'
-    highlight_color: str= '#ffff00'  # Default highlight color
-    plot_by: Literal['', 'misfit', 'doi', 'date', '_line_1_x', '_line_1_y'] = ''
-    buffer_color: str= "#ffffff"  # Default buffer color
-    dragmode: str='select'
     view: dict = None
-    markersize: int=14
-    line_width: int=3
     legend: bool = False
-    mean_res: int = 0
-    Borehole_color: str = "#00e1ff"
-    Borehole_markersize: int=12
 
 
 class Map(Panel):
@@ -300,15 +366,63 @@ class Map(Panel):
     highlighted: int = None
     buffer_sites: list = None
     lines = None
-    boreholes = None       
+    boreholes = None
     rock_color_map = None
-       
+    # Suppressing the highlight/buffer-window overlays on Interpret only
+    # (not Review/QC, where they're still wanted) needs render() to know
+    # which tab is active -- toggled directly in app.py's update_layout on
+    # tab switch.
+    suppress_highlight = False
+    # report.py sets this for every report figure except the dedicated
+    # Enabled/Disabled one -- the gray+ring overlay is otherwise always
+    # drawn regardless of plot_by mode, which cluttered every other
+    # report figure with it.
+    suppress_disabled_overlay = False
+    # app.py's export_interpret_view() sets this while exporting -- the
+    # editable/erasable line shape (see the 'eraseshape' overlay below) is
+    # positioned in fixed paper coordinates baked in at whatever pixel
+    # size the live browser last rendered at, so re-rendering the same
+    # figure at the export's own PNG dimensions (a different width/height
+    # than the live browser) leaves the shape visibly offset from the
+    # real Scattermap line trace underneath it -- a second, near-identical,
+    # dashed line. It's purely an interactive drag-to-edit affordance with
+    # nothing to add to a static export, so skip it there entirely rather
+    # than trying to keep two independently-positioned copies of the same
+    # line in sync.
+    suppress_line_shape_overlay = False
+    # Mean-res grid parameters (see make_grid()) -- how far a site's
+    # colored patch extends (buffer_pixel * pixel_size, in meters) before
+    # the base map shows through. Tuned for the live GUI's usual zoomed-in
+    # view; report.py temporarily raises grid_buffer_pixel for Appendix B,
+    # whose figures are zoomed out to the whole survey area, where the
+    # default ~100m buffer around each site is imperceptibly small.
+    grid_pixel_size = 25.
+    grid_buffer_pixel = 4
+
 
     def __init__(self, data, **kwargs):
         settings = MapSettings(id='map', **kwargs)
         super().__init__(id='map', settings=settings)
         self.dataframe = data
-        self.layer_order=['tif', 'meanres', 'buffer', 'sites', 'highlight', 'lines', 'boreholes_outline', 'boreholes']
+        self.layer_order=['tif', 'meanres', 'buffer', 'sites', 'disabled_sites_ring', 'disabled_sites', 'highlight', 'lines', 'boreholes_outline', 'boreholes']
+
+    @staticmethod
+    def _gates_used_groups(df_plot, enabled_label):
+        """
+        Per-site legend-group mapping for modes whose only real
+        categorization is enabled vs. disabled (the "Enabled"/"From
+        Import" and "Disabled" legend entries) -- used to split the
+        buffer-window overlay in render() so it hides/shows in sync with
+        those legend entries, the same way the discrete 'date' mode's
+        buffer split follows its date legend entries.
+        """
+        if 'gates_used' in df_plot.columns:
+            is_disabled = df_plot['gates_used'] == 0
+        else:
+            is_disabled = pd.Series(False, index=df_plot.index)
+        group_col = np.where(is_disabled, 'Disabled', enabled_label)
+        site_group_map = pd.Series(group_col, index=df_plot['site_id'].values)
+        return site_group_map, [enabled_label, 'Disabled']
 
     def render(self):
         if self.dataframe is None: return self.empty_render()
@@ -320,53 +434,298 @@ class Map(Panel):
         center = self.settings.view['map.center'] if self.settings.view is not None else None
 
         c_layers = []
+        # Set below by whichever branch uses a discrete/categorical legend
+        # (date, enabled_disabled, and the plain "From Import" view) --
+        # site_group_map maps site_id -> that site's legend group name,
+        # buffer_group_labels lists the groups in display order. Left None
+        # for the continuous misfit/doi colorbar view, which has no
+        # legend entries to sync against. Lets the buffer-window overlay
+        # further down split itself the same way, so each group's buffer
+        # markers share that group's legendgroup and hide/show together
+        # with it when its legend entry is clicked.
+        site_group_map = None
+        buffer_group_labels = None
+        # Set below by the misfit/doi branch to the set of site_ids that
+        # actually have a marker in the CURRENT mode (disabled sites are
+        # excluded from that base trace there -- see df_plot_here). None
+        # (every other mode) means no restriction. Used further down to
+        # keep the buffer-window/highlight rings from being drawn around
+        # a disabled site that has no colored marker underneath them to
+        # ring in the first place.
+        plottable_site_ids = None
 
-        if self.settings.plot_by in self.dataframe.columns:
+        if self.settings.plot_by == 'enabled_disabled':
+            # Categorical, not a continuous colorscale -- no colorbar, so
+            # this can't collide with the mean-res colorbar the way
+            # misfit/doi/date do (those are mutually exclusive with mean
+            # res in the callbacks below anyway). Disabled sites get their
+            # own gray+black-ring overlay further down, drawn regardless
+            # of mode -- excluded here (rather than included and just
+            # drawn over) so a disabled site has exactly one on-map
+            # representation: hiding the "Disabled" legend entry then
+            # actually removes it from the map instead of leaving its
+            # plain black dot from this trace behind underneath.
+            enabled_df = df_plot[df_plot['gates_used'] != 0] if 'gates_used' in df_plot.columns else df_plot
+            fig = px.scatter_map(enabled_df, lat="latitude", lon="longitude", custom_data='site_id',
+                                 zoom=zoom, center=center, color_discrete_sequence=['black'])
+            fig.update_traces(marker=dict(size=self.settings.markersize), name='Enabled',
+                              legendgroup='Enabled', showlegend=True)
+            site_group_map, buffer_group_labels = self._gates_used_groups(df_plot, enabled_label='Enabled')
+        elif self.settings.plot_by == 'date' and 'date' not in self.dataframe.columns:
+            # No 'date' column at all yet (shouldn't normally happen --
+            # unlike misfit/doi it's populated from raw import, not only
+            # after inversion -- but fall back to the plain view rather
+            # than a KeyError if it's ever missing).
+            fig = px.scatter_map(df_plot, lat="latitude", lon="longitude", custom_data='site_id',
+                                 zoom=zoom, center=center, color_discrete_sequence=[self.settings.color])
+            fig.update_traces(marker=dict(size=self.settings.markersize), name='From Import',
+                              legendgroup='From Import', showlegend=True)
+            site_group_map, buffer_group_labels = self._gates_used_groups(df_plot, enabled_label='From Import')
+        elif self.settings.plot_by == 'date':
+            # Discrete/categorical, like enabled_disabled above -- one
+            # solid color AND legend entry per distinct survey date,
+            # rather than a shared colorbar (banded or otherwise). Tried
+            # after the continuous banded-colorbar approach (still used
+            # for misfit/doi below) got hard to read past ~17 distinct
+            # dates: a legend scales better than a color strip once there
+            # are that many categories, since each date gets its own
+            # named, individually togglable entry instead of a shared
+            # narrow band.
+            df_plot = df_plot.copy()
+            dt = pd.to_datetime(df_plot['date'].astype('Int64').astype(str), format='%Y%m%d', errors='coerce')
+            df_plot['_date_label'] = dt.dt.strftime('%Y-%m-%d')
+            df_plot.loc[dt.isna(), '_date_label'] = 'Unknown date'
+            unique_labels = sorted(df_plot['_date_label'].unique())
+            if 'Unknown date' in unique_labels:
+                unique_labels.remove('Unknown date')
+                unique_labels.append('Unknown date')
+            n_labels = len(unique_labels)
+            sample_points = [i / (n_labels - 1) for i in range(n_labels)] if n_labels > 1 else [0.5]
+            palette = px.colors.sample_colorscale('turbo', sample_points)
+            fig = px.scatter_map(df_plot, lat="latitude", lon="longitude", custom_data='site_id',
+                                 zoom=zoom, center=center, color='_date_label',
+                                 category_orders={'_date_label': unique_labels},
+                                 color_discrete_sequence=palette)
+            fig.update_traces(marker=dict(size=self.settings.markersize), showlegend=True)
+            site_group_map = df_plot.set_index('site_id')['_date_label']
+            buffer_group_labels = unique_labels
+        elif self.settings.plot_by in self.dataframe.columns:
 
-            fig = px.scatter_map(df_plot, lat="latitude", lon="longitude", zoom=zoom, center=center, 
+            # Disabled sites' misfit/doi values are stale/meaningless (see
+            # the disabled-overlay note further down) -- excluded from
+            # this continuous-colorbar view entirely, same as every mode
+            # except Enabled/Disabled itself (the only place disabled
+            # sites are still shown, via their own gray+ring overlay). A
+            # separate df_plot_here (not reassigning df_plot) since the
+            # disabled-overlay trace below still needs the FULL,
+            # unfiltered df_plot to find those sites in the first place.
+            df_plot_here = df_plot[df_plot['gates_used'] != 0] if 'gates_used' in df_plot.columns else df_plot
+            plottable_site_ids = set(df_plot_here['site_id'])
+            # Buffer-window sub-traces always get one trace per group,
+            # same as every other mode (see the constant-trace-count note
+            # below) -- plottable_site_ids above keeps the 'Disabled'
+            # group's own sub-trace empty regardless of what's actually
+            # in self.buffer_sites, rather than relying on this grouping
+            # alone (a disabled site CAN legitimately end up in
+            # buffer_sites, e.g. via a box-select spanning both).
+            site_group_map, buffer_group_labels = self._gates_used_groups(df_plot, enabled_label='sites')
+
+            # plot_by columns like 'misfit'/'doi' only get populated once a
+            # site has actually been inverted -- they're global columns on
+            # sesh.data as soon as ANY site anywhere has, so a newly
+            # uploaded/not-yet-inverted site shows NaN here, which Plotly
+            # renders with no color at all (looks black). Pin those to the
+            # colorscale's own max instead of leaving them NaN: 'turbo'
+            # is dark red at its high end, close to the plain marker color
+            # sites get when no plot_by is selected at all, and pinning to
+            # the EXISTING data's own max (via an explicit range_color)
+            # rather than leaving it to auto-scale keeps the color mapping
+            # for sites that DO have real values unchanged.
+            color_col = df_plot_here[self.settings.plot_by]
+            has_value = color_col.notna()
+            if has_value.any():
+                cmin = float(color_col[has_value].min())
+                cmax = float(color_col[has_value].max())
+            else:
+                cmin, cmax = 0.0, 1.0
+            df_plot_here = df_plot_here.copy()
+            df_plot_here.loc[~has_value, self.settings.plot_by] = cmax
+
+            fig = px.scatter_map(df_plot_here, lat="latitude", lon="longitude", zoom=zoom, center=center,
                                  color=self.settings.plot_by, color_continuous_scale='turbo',
+                                 range_color=[cmin, cmax],
                                  custom_data='site_id'
                                  )
-            fig.update_traces(marker=dict(size=self.settings.markersize), name='sites')
+            # A discrete legend swatch doesn't mean anything for a
+            # continuous colorscale trace -- the colorbar above already
+            # communicates it.
+            fig.update_traces(marker=dict(size=self.settings.markersize), name='sites', showlegend=False)
             fig.update_layout(
                 coloraxis_colorbar=dict(
-                    orientation="h", 
+                    orientation="h",
                     y=-0.01,
-                    x=0.5,          
+                    x=COLORBAR_X,
                     xanchor="center",
                     yanchor="top",
-                    len=0.75,
+                    len=COLORBAR_LEN,
                     thickness = 10,
-                    title=dict(
-                text='',
-                side="bottom"))
+                    # Plotly Express defaults the colorbar title to the
+                    # raw column name (e.g. "misfit") -- clear it
+                    # explicitly, since add_colorbar_title below draws the
+                    # real label to the left instead. Without this the two
+                    # ended up showing side by side.
+                    title=dict(text=''),
+                )
             )
-            c_layers.append('sites')
+            add_colorbar_title(fig, PLOT_BY_COLORBAR_TITLES.get(self.settings.plot_by, ''))
         else:
             fig = px.scatter_map(df_plot, lat="latitude", lon="longitude", custom_data='site_id',
                                  zoom=zoom, center=center, color_discrete_sequence=[self.settings.color])
-            fig.update_traces(marker=dict(size=self.settings.markersize), name='sites')
-            c_layers.append('sites')
+            fig.update_traces(marker=dict(size=self.settings.markersize), name='From Import',
+                              legendgroup='From Import', showlegend=True)
+            site_group_map, buffer_group_labels = self._gates_used_groups(df_plot, enabled_label='From Import')
 
-        if self.buffer_sites is not None:
-            self.buffer_sites = self.dataframe['site_id'].unique().tolist()
-            df_buffer = self.dataframe.copy()
+        # Every branch above builds `fig` from exactly the site markers --
+        # normally a single trace, but the discrete 'date' branch produces
+        # one trace per distinct date. Label all of them generically here
+        # (rather than each branch guessing its own trace count) so the
+        # layer-reordering pass below can find and position every one of
+        # them, however many there turned out to be.
+        site_layer_names = [f'sites_{i}' for i in range(len(fig.data))] if len(fig.data) > 1 else ['sites']
+        c_layers.extend(site_layer_names)
+        layer_order = list(self.layer_order)
+        if site_layer_names != ['sites']:
+            sites_idx = layer_order.index('sites')
+            layer_order[sites_idx:sites_idx + 1] = site_layer_names
+
+        # Sites where every gate was manually disabled still get a model
+        # from the joint SCI inversion (spatially interpolated from
+        # neighbors, with zero actual weight from their own data) --
+        # temframe.invert() strips that model/synthetic fit back out, so
+        # 'gates_used'==0 (from sesh.update_site_table's per-site sum of
+        # 'include') is what's left to flag them here. Drawn as a separate,
+        # always-present (even when empty) pair of overlay traces -- named
+        # something other than 'sites' so they can never satisfy
+        # `curve_number = m1._layers.index('sites')` in
+        # handle_map_interactions, meaning clicks/lasso-select on these
+        # markers are silently ignored rather than mis-selecting a site.
+        # Gray fill with a black ring, distinct from every other marker
+        # color used on this map (site colors, highlight, buffer, mean
+        # res). Two stacked circle traces (black underneath, slightly
+        # larger; gray on top) fake the ring, since go.Scattermap's marker
+        # has no 'line'/border property the way ordinary go.Scatter does.
+        # Only actually populated in Enabled/Disabled mode -- in every
+        # other plot_by (From Import, misfit, doi, date), disabled sites
+        # are colored the same as everyone else and this overlay would
+        # just clutter a view that isn't about enabled/disabled status.
+        if ('gates_used' in df_plot.columns and not self.suppress_disabled_overlay
+                and self.settings.plot_by == 'enabled_disabled'):
+            disabled_df = df_plot[df_plot['gates_used'] == 0]
         else:
-            df_buffer = self.dataframe.copy()[self.dataframe["site_id"].isin(self.buffer_sites)]
+            disabled_df = df_plot.iloc[0:0]
+        fig.add_trace(go.Scattermap(
+            lat=disabled_df['latitude'], lon=disabled_df['longitude'],
+            mode='markers',
+            marker=dict(size=self.settings.markersize + 4, color='black'),
+            name='Disabled sites',
+            legendgroup='Disabled',
+            hoverinfo='skip',
+            showlegend=False,
+            # Wrapped in a single-column 2D array, matching the [site_id]
+            # per-point shape px.scatter_map's custom_data='site_id'
+            # produces elsewhere on this figure -- handle_map_interactions
+            # reads point['customdata'][0] uniformly across every trace.
+            customdata=disabled_df[['site_id']].values,
+        ))
+        c_layers.append('disabled_sites_ring')
+        # customdata=site_id (added here, not present before) lets
+        # app.py's handle_map_interactions box-select handler recognize
+        # points on this trace and resolve them back to a real site_id --
+        # previously this trace carried no customdata at all specifically
+        # so box-selecting a disabled site would be silently ignored;
+        # disabled sites are now includable in a selection just like any
+        # other site.
+        fig.add_trace(go.Scattermap(
+            lat=disabled_df['latitude'], lon=disabled_df['longitude'],
+            mode='markers',
+            marker=dict(size=self.settings.markersize, color='#999999'),
+            name='Disabled',
+            legendgroup='Disabled',
+            hoverinfo='skip',
+            showlegend=True,
+            # Wrapped in a single-column 2D array, matching the [site_id]
+            # per-point shape px.scatter_map's custom_data='site_id'
+            # produces elsewhere on this figure -- handle_map_interactions
+            # reads point['customdata'][0] uniformly across every trace.
+            customdata=disabled_df[['site_id']].values,
+        ))
+        c_layers.append('disabled_sites')
+
+        # Always add the buffer/highlight traces, even with zero points,
+        # instead of only adding them when there's something to show. The
+        # map's trace COUNT must stay constant across renders: Plotly's
+        # MapLibre-based scatter_map traces are fragile when Plotly.react()
+        # has to add/remove entire layers (vs. just updating data within
+        # existing ones) -- conditionally including these traces caused the
+        # browser to throw "Map error" from its internal MapLibre layer
+        # management, and once that failed once the map stopped updating
+        # at all on every subsequent render.
+        if self.buffer_sites is not None and not self.suppress_highlight:
+            df_buffer = self.dataframe[self.dataframe["site_id"].isin(self.buffer_sites)]
+        else:
+            df_buffer = self.dataframe.iloc[0:0]
+        if plottable_site_ids is not None:
+            # A disabled site can legitimately end up in buffer_sites
+            # (e.g. box-selected together with enabled ones) -- without
+            # this, its buffer-window ring would still get drawn even
+            # though the current mode (misfit/doi) has no colored marker
+            # under it, leaving a ring floating with nothing inside it.
+            df_buffer = df_buffer[df_buffer['site_id'].isin(plottable_site_ids)]
+
+        if site_group_map is not None:
+            # Split to match whichever discrete/categorical legend the
+            # current mode uses (date, Enabled/Disabled, or From Import/
+            # Disabled), sharing each group's legendgroup (showlegend=
+            # False so it adds no legend row of its own) -- Plotly toggles
+            # every trace sharing a legendgroup together on a single
+            # legend click, so hiding a group from the legend now also
+            # hides its buffer-window ring. Emit one sub-trace per group
+            # that exists in df_plot OVERALL (not just ones represented in
+            # the current buffer), even when empty for this particular
+            # buffer window, so the trace count stays constant as the
+            # buffer pages -- only the data, not the trace count, should
+            # change between renders within the same mode (see the
+            # constant-trace-count note above).
+            df_buffer = df_buffer.copy()
+            df_buffer['_group'] = df_buffer['site_id'].map(site_group_map)
+            for label in buffer_group_labels:
+                df_group = df_buffer[df_buffer['_group'] == label]
+                buffer_trace = px.scatter_map(df_group, lat="latitude", lon="longitude", zoom=zoom, center=center)
+                buffer_trace.update_traces(
+                    marker=dict(size=self.settings.markersize*1.5, color=self.settings.buffer_color),
+                    name="Buffer window", legendgroup=label, showlegend=False,
+                )
+                for trace in buffer_trace.data:
+                    fig.add_trace(trace)
+            buffer_layer_names = [f'buffer_{i}' for i in range(len(buffer_group_labels))]
+        else:
             buffer_trace = px.scatter_map(
                 df_buffer,
                 lat="latitude",
                 lon="longitude",
-                zoom=zoom, center=center, 
+                zoom=zoom, center=center,
             )
-            c_layers.append('buffer')
             buffer_trace.update_traces(
                 marker=dict(size=self.settings.markersize*1.5, color=self.settings.buffer_color),
-                name="Buffer window"
+                name="Buffer window", showlegend=False
             )
-
             for trace in buffer_trace.data:
                 fig.add_trace(trace)
+            buffer_layer_names = ['buffer']
+        c_layers.extend(buffer_layer_names)
+        if buffer_layer_names != ['buffer']:
+            buffer_idx = layer_order.index('buffer')
+            layer_order[buffer_idx:buffer_idx + 1] = buffer_layer_names
 
         fig.update_layout(map_style="white-bg",
             map_layers=[
@@ -375,31 +734,80 @@ class Map(Panel):
                     "sourcetype": "raster",
                     "source": ['https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}']
                 }])
-        if self.highlighted is not None:
-            # highlight_trace = px.scatter_map(df_plot[df_plot.index == self.highlighted], lat="latitude", lon="longitude", zoom=zoom, center=center, color_discrete_sequence=[self.settings.highlight_color])
-            highlighted_df = df_plot[df_plot.index.isin(self.highlighted)]
-            highlight_trace = px.scatter_map(
-                highlighted_df,
-                lat="latitude",
-                lon="longitude",
-                zoom=zoom,
-                center=center,
-                color_discrete_sequence=[self.settings.highlight_color])
-            
-            highlight_trace.update_traces(marker=dict(size=self.settings.markersize*2))
-            for trace in highlight_trace.data:
-                fig.add_trace(trace)
-                c_layers.append("highlight")
 
-        if self.lines is not None and self.settings.dragmode=='drawline':
-            for line_id in self.lines.line.unique():
-                fig.add_shape(self.line2path(line_id))
-        elif self.lines is not None:
+        # self.highlighted holds site_id values (set throughout
+        # unified_handler from df_data["site_id"]), not row positions --
+        # match against the site_id column, same as buffer_sites above,
+        # rather than the dataframe's row index (which only happens to
+        # line up with site_id by coincidence, and drifts once the
+        # dataframe gets filtered/reordered). It's set to a plain scalar
+        # by single-site callbacks (cross_panel_click, highlight_change)
+        # and to a list by multi-select ones (unified_handler) -- isin()
+        # requires list-like, so normalize a scalar into a single-item list.
+        if self.highlighted is not None and not self.suppress_highlight:
+            highlighted_ids = self.highlighted if isinstance(self.highlighted, (list, tuple, set, np.ndarray, pd.Series)) else [self.highlighted]
+            highlighted_df = df_plot[df_plot['site_id'].isin(highlighted_ids)]
+            if plottable_site_ids is not None:
+                # Same reasoning as the buffer-window ring above -- don't
+                # ring a disabled site in a mode that draws no marker for
+                # it at all.
+                highlighted_df = highlighted_df[highlighted_df['site_id'].isin(plottable_site_ids)]
+        else:
+            highlighted_df = df_plot.iloc[0:0]
+        highlight_trace = px.scatter_map(
+            highlighted_df,
+            lat="latitude",
+            lon="longitude",
+            zoom=zoom,
+            center=center,
+            color_discrete_sequence=[self.settings.highlight_color])
+        highlight_trace.update_traces(marker=dict(size=self.settings.markersize*2), showlegend=False)
+        for trace in highlight_trace.data:
+            fig.add_trace(trace)
+            c_layers.append("highlight")
+
+        if self.lines is not None:
+            # Always draw the click-detectable trace (used by
+            # update_highlight() below to set the model_section x-axis on
+            # click) regardless of the current map tool -- previously this
+            # was only added outside 'drawline' mode, which meant the
+            # figure's trace count changed every time the user toggled the
+            # draw tool on/off with the same set of lines drawn. MapLibre
+            # traces are fragile about this (see the always-present
+            # 'disabled_sites' overlay elsewhere in this file for the same
+            # reasoning): an inconsistent trace count across renders can
+            # permanently break the map, which is a plausible reason the
+            # eraser button/line interactions felt unreliable.
             fig2 = px.line_map(self.lines, lat='latitude', lon='longitude', line_group='line', color='line', zoom=zoom, center=center, color_discrete_sequence=line_colors)
             fig2.update_traces(mode='lines', hovertemplate='Line%{line:.0f}', line=dict(width=self.settings.line_width))
             fig = go.Figure(data=fig.data+fig2.data, layout=fig.layout)
             for i in range(len(fig2.data)):
                 c_layers.append(f'line_{i:02d}')
+
+            # Also always draw the editable/erasable shape overlay (used
+            # only for the modebar's "eraseshape" button), not just while
+            # dragmode=='drawline'. Plotly only allows shapes to actually
+            # be dragged/edited while dragmode is one of the draw tools or
+            # 'select', so leaving them in during 'pan'/'zoom' doesn't
+            # interfere with normal map navigation -- but restricting them
+            # to 'drawline' only meant the eraser button had nothing to
+            # act on the moment the user switched to any other tool
+            # (e.g. the default 'select' mode), which is most of the time.
+            # Guarded on settings.view, since paper2latlon/line2path need
+            # a viewport bounding box that isn't set yet on the very first
+            # render before any pan/zoom has happened -- specifically
+            # 'map._derived', populated by a real relayoutData event from
+            # the browser (map.bearing/pitch alone aren't enough). report.py
+            # sets a minimal, synthetic view (center/zoom only, no real
+            # viewport) to frame report figures, which doesn't have this --
+            # skip the shape overlay in that case rather than crashing.
+            # It's purely an interactive affordance for the "eraseshape"
+            # modebar button anyway, invisible on top of the already-drawn
+            # line trace, so a report figure loses nothing by omitting it.
+            if (self.settings.view is not None and 'map._derived' in self.settings.view
+                    and not self.suppress_line_shape_overlay):
+                for line_id in self.lines.line.unique():
+                    fig.add_shape(self.line2path(line_id))
 
         hovermode = False #if self.settings.dragmode=='drawline' else None
         fig.update_layout(margin={"r":0,"t":0,"l":0,"b":0},
@@ -412,12 +820,17 @@ class Map(Panel):
             bh_lats = [bh['map_lat'] for bh in self.boreholes]
             bh_lons = [bh['map_lon'] for bh in self.boreholes]
             bh_ids  = [bh['id'] for bh in self.boreholes]
-            # Outline trace
+            # Outline trace. Shares the main trace's legendgroup (with its
+            # own showlegend=False, so it adds no separate legend row) --
+            # without this, toggling "Boreholes" off in the legend only
+            # hid the colored dots and left this black ring stuck on the
+            # map, the same problem the buffer-window rings had before
+            # they were grouped with their site traces.
             fig.add_trace(go.Scattermap(
                     lat=bh_lats, lon=bh_lons,
                     mode='markers',
                     marker=dict(size=self.settings.Borehole_markersize+2, color='black', symbol='circle'),
-                    showlegend=False, hoverinfo='skip',
+                    legendgroup='Boreholes', showlegend=False, hoverinfo='skip',
                 ))
             c_layers.append('boreholes_outline')
             fig.add_trace(go.Scattermap(
@@ -426,34 +839,79 @@ class Map(Panel):
                 mode='markers',
                 marker=dict(size=self.settings.Borehole_markersize, color=self.settings.Borehole_color, symbol='circle'),
                 name='Boreholes',
+                legendgroup='Boreholes',
                 text=bh_ids,
                 hovertemplate='%{text}<extra></extra>',
                 # showlegend=False,
               ))
-            fig.update_layout(showlegend=True,
-                legend=dict(x=0.01, y=0.99,
-                    xanchor="left",yanchor="top",
-                    bgcolor="rgba(255,255,255,0.5)",  # semi-transparent background
-                    bordercolor="black",borderwidth=1,
-                ))
             c_layers.append('boreholes')
 
         
-        if hasattr(self, 'grid') and self.grid is not None:
-            from __main__ import sesh
-            z_new = np.array([self.settings.mean_res, self.settings.mean_res+1])*10.
-            res_grid = np.log10(rediscretize(sesh.models, z_new))
-            # res_grid = 
-            fig.add_trace(self.grid.graph_object(res_grid, zmin=0, zmax=2, colorscale='Turbo', name='Mean Res'))
-            c_layers.append('meanres')
-        
+        # Same constant-trace-count requirement as buffer/highlight above:
+        # this MUST add exactly one 'meanres' trace on every single render,
+        # from the very first one (before any data/model exists), or the
+        # first time it turns from absent to present is itself a trace-
+        # count change that risks wedging the MapLibre map. So build the
+        # grid lazily here (self-healing if the site set has changed since
+        # the last build) rather than relying on make_grid() having been
+        # called externally, and fall back to an empty placeholder trace
+        # when there's nothing to show yet.
+        from __main__ import sesh
+        self._ensure_grid()
+
+        if (self.settings.mean_res != -1 and getattr(self, 'grid', None) is not None
+                and sesh.models is not None and not sesh.models.empty):
+            depth_top, depth_bottom = self._mean_res_z_new()
+            mean_res_by_site = mean_resistivity_band(sesh.models, depth_top, depth_bottom)
+            # Reindex to self.dataframe's site order -- Grid's mesh_idxs
+            # are positional against that same order, not against
+            # whatever order/coverage sesh.models happens to have.
+            res_grid = mean_res_by_site.reindex(self.dataframe['site_id'].values).values
+            with np.errstate(invalid='ignore', divide='ignore'):
+                res_grid = np.log10(res_grid)
+            # Match the Model Section panel's own resistivity colorscale
+            # range (mod2.settings.vmin/vmax) rather than a hardcoded
+            # 1-100 Ohm*m, so a given color means the same resistivity in
+            # both places.
+            from __main__ import mod2
+            zmin = np.log10(mod2.settings.vmin)
+            zmax = np.log10(mod2.settings.vmax)
+            fig.add_trace(self.grid.graph_object(
+                res_grid, zmin=zmin, zmax=zmax, colorscale='Turbo', name='Mean Res',
+                # Continuous colorscale, communicated via the colorbar --
+                # not a discrete legend entry.
+                showlegend=False,
+                # Same horizontal, bottom-centered placement as the
+                # misfit/doi/date coloraxis colorbar above, so whichever
+                # one is currently showing (mean res and plot_by are
+                # mutually exclusive) always appears in the same spot.
+                colorbar=dict(
+                    orientation="h",
+                    y=-0.01,
+                    x=COLORBAR_X,
+                    xanchor="center",
+                    yanchor="top",
+                    len=COLORBAR_LEN,
+                    thickness=10,
+                    title=dict(text=''),
+                ),
+            ))
+            add_colorbar_title(fig, 'Resistivity [log10 Ωm]')
+        else:
+            fig.add_trace(go.Choroplethmap(
+                geojson={"type": "FeatureCollection", "features": []},
+                locations=[], z=[],
+                showscale=False, name='Mean Res',
+            ))
+        c_layers.append('meanres')
+
         data_list = list(fig.data)
         reordered_data = []
         reordered_labels = []
         used_id = np.zeros(len(data_list), dtype=bool)
         
-        for layer in self.layer_order:
-            if layer in c_layers: 
+        for layer in layer_order:
+            if layer in c_layers:
                 reordered_data.append(data_list[c_layers.index(layer)])
                 used_id[c_layers.index(layer)] = True
                 reordered_labels.append(layer)
@@ -465,15 +923,132 @@ class Map(Panel):
         fig.data = reordered_data
         self._layers = reordered_labels
 
-        if self.settings.legend:
-            fig.update_layout(showlegend=True,
-                legend=dict(x=0.01, y=0.99,
-                    xanchor="left",yanchor="top",
-                    bgcolor="rgba(255,255,255,0.5)",  # semi-transparent background
-                    bordercolor="black",borderwidth=1,
-                ),
-                # legend_itemsizing='constant',
-            )
+        # Stable, name-derived uid per trace -- without this, Plotly falls
+        # back to matching traces by their ARRAY POSITION when deciding
+        # what UI state (e.g. a legend-hidden trace, see legend.uirevision
+        # below) to carry over from the previous render. This reordering
+        # step alone can shift a trace's index between renders even when
+        # nothing about it changed, and legend-click toggling was landing
+        # on the wrong trace on the next render as a result (a hidden
+        # trace's legend row could vanish, or reappear unclickable) --
+        # tagging each trace by its own layer name instead makes that
+        # matching correct regardless of index/order.
+        for trace, label in zip(fig.data, reordered_labels):
+            trace.uid = f"map-{label}"
+
+        # Per-layer, point-index -> site_id lookup, built from each
+        # trace's OWN customdata (server-side, on the Python trace object
+        # -- reliable) rather than trusting that a point's position in
+        # its trace equals its site_id (only true when a trace's source
+        # dataframe happens to be in site_id order with no rows removed,
+        # which broke the moment 'sites' started excluding disabled
+        # sites) or reading customdata back off the browser's
+        # selectedData payload (confirmed elsewhere in this app -- see
+        # unified_handler's Model Section note -- that Dash/Plotly here
+        # never actually includes customdata in that payload, only
+        # curveNumber/pointNumber/x/y/lat/lon). app.py's
+        # handle_map_interactions uses this dict, keyed by the SAME
+        # layer names as self._layers, to resolve a box-selected point
+        # back to its real site_id using only curveNumber+pointNumber,
+        # both of which selectedData does reliably include.
+        self._layer_site_ids = {}
+        for trace, label in zip(fig.data, reordered_labels):
+            if trace.customdata is not None:
+                self._layer_site_ids[label] = [int(row[0]) for row in trace.customdata]
+
+        # A fresh, guaranteed-unique top-level uirevision on EVERY single
+        # render, set here rather than trusted to each caller -- several
+        # call sites (e.g. update_plotby/update_mean_res below, triggered
+        # by the plot-by/mean-res dropdowns) return self.render()'s figure
+        # directly with no uirevision override of their own, which left
+        # layout.uirevision at Plotly's default (effectively constant/
+        # unset) for those renders. Once traces got stable uids (see
+        # above) and a constant legend.uirevision (see below), a constant
+        # TOP-level uirevision too meant Plotly tried to carry over
+        # whatever visibility state it last had for a given uid across
+        # renders where the underlying data had genuinely changed --
+        # e.g. the disabled-sites overlay going from real points to zero
+        # points (switching plot_by away from Enabled/Disabled) and back,
+        # which could leave it stuck hidden with no explicit user click
+        # ever responsible. Callers that separately set their own fresh
+        # uirevision (unified_handler, handle_map_interactions) just
+        # overwrite this with an equally-fresh one -- harmless either way.
+        fig.update_layout(uirevision=f"map-render-{time.time()!r}")
+
+        # legend.uirevision (see below) used to be one hardcoded constant
+        # -- confirmed via live console debugging (browser-side
+        # plotly_afterplot logs compared against these render() prints)
+        # that this made a legend-click hide (e.g. "Disabled") persist
+        # not just across pans/zooms within the SAME mode (wanted -- see
+        # the comment below) but FOREVER, across every future mode
+        # switch too, since it's the exact same string every single
+        # render regardless of plot_by. Switching to Misfit carried the
+        # hide over (nothing wrong with that on its own), but switching
+        # BACK to Enabled/Disabled kept it hidden too, with no click
+        # available to undo it that actually worked as one -- the only
+        # fix was a full page reload. Bumping this counter every time
+        # plot_by actually changes (not on every render -- e.g. plain
+        # panning/zooming within one mode doesn't touch it) gives each
+        # mode its own fresh, never-repeated legend.uirevision value:
+        # hides still persist across renders WITHIN a mode, but every
+        # mode switch starts that mode's legend clean.
+        if getattr(self, '_last_plot_by_for_legend', None) != self.settings.plot_by:
+            self._legend_revision = getattr(self, '_legend_revision', 0) + 1
+            self._last_plot_by_for_legend = self.settings.plot_by
+
+        # Always on now (the old settings.legend toggle is hidden --
+        # see MapSettings.hidden_settings): with disabled sites, the
+        # enabled/disabled color mode, and the plain "From Import" view
+        # all needing a legend to be readable, there's no longer a mode
+        # where the map has nothing worth labeling.
+        fig.update_layout(showlegend=True,
+            legend=dict(x=0.01, y=0.99,
+                xanchor="left",yanchor="top",
+                bgcolor="rgba(255,255,255,0.5)",  # semi-transparent background
+                bordercolor="black",borderwidth=1,
+                # Every buffer-window ring/disabled-ring trace above is
+                # wired to share a legendgroup with its "real" legend
+                # entry (Disabled, Enabled, From Import, etc.) but has
+                # showlegend=False itself, so there's only ever ONE
+                # clickable row per group. Plotly's default groupclick
+                # ('toggleitem') only toggles the exact trace you clicked,
+                # NOT its showlegend=False groupmates -- so without this,
+                # clicking e.g. "Disabled" hid the gray fill but left its
+                # black ring (and buffer-window ring, if any) on the map.
+                # 'togglegroup' makes one click hide every trace sharing
+                # that legendgroup together, which is what all of this
+                # grouping was actually meant to achieve.
+                groupclick="togglegroup",
+                # app.py's unified_handler (and other callbacks) give this
+                # figure a fresh, guaranteed-unique layout.uirevision on
+                # every single render -- deliberately, so stale selection
+                # highlighting never survives across re-renders (see
+                # unified_handler's own uirevision comment). But Plotly
+                # ties legend-click visibility ("hide this trace") to
+                # uirevision too by default, so every pan/zoom/click that
+                # triggers a re-render was also silently un-hiding
+                # anything the user had just clicked off in the legend
+                # (e.g. "Disabled"). legend.uirevision is independent of
+                # the top-level one -- pinning it to a constant here means
+                # legend-driven visibility survives re-renders regardless
+                # of what the caller sets layout.uirevision to. See the
+                # _legend_revision comment above for why this is no
+                # longer a bare constant.
+                uirevision=f"map-legend-{self._legend_revision}",
+            ),
+        )
+
+        # TEMPORARY DEBUG -- tracking down the disabled-overlay/legend
+        # visibility bug. Prints exactly what this render is telling
+        # Plotly, every single time render() runs, so it can be compared
+        # against what the browser console (see the matching TEMPORARY
+        # DEBUG block in panels.py) says Plotly actually did with it.
+        # Remove once the bug's root cause is confirmed.
+        print(f"[map.render DEBUG] plot_by={self.settings.plot_by!r} uirevision={fig.layout.uirevision!r} "
+              f"legend.uirevision={fig.layout.legend.uirevision!r}")
+        for t in fig.data:
+            print(f"    trace name={t.name!r:20} uid={t.uid!r:28} legendgroup={t.legendgroup!r:12} "
+                  f"showlegend={t.showlegend!r:5} visible={t.visible!r:6} n_points={len(t.lat) if hasattr(t, 'lat') and t.lat is not None else 'n/a'}")
 
         return fig
     
@@ -544,7 +1119,7 @@ class Map(Panel):
             [
                 html.Div(
                     [
-                        html.Div(  
+                        html.Div(
                             dcc.Graph(
                                 figure=self.render(),
                                 id=self.id,
@@ -559,42 +1134,57 @@ class Map(Panel):
                                 'flex': '1',
                                 'minHeight': 0,
                                 'boxSizing': 'border-box',
-                                'marginBottom': '50px'
                             }
                         ),
 
-                        dbc.Select(
-                            options=self.settings.schema['properties']['plot_by']['enum'],
-                            id=self.id+'_plot_by',
-                            value=self.settings.plot_by,
+                        # Sits in normal flow below the graph (not overlaid on
+                        # top of it) -- a plain row, not the absolutely
+                        # positioned floating box style used elsewhere, since
+                        # there's no map content underneath here to float over.
+                        html.Div(
+                            [
+                                html.Div(
+                                    [
+                                        dbc.Label("Color by", html_for=self.id+'_plot_by', class_name="mb-0", style=FLOATING_BOX_LABEL_STYLE),
+                                        dbc.Select(
+                                            options=[{'label': PLOT_BY_LABELS.get(v, v), 'value': v}
+                                                     for v in self.settings.schema['properties']['plot_by']['enum']],
+                                            id=self.id+'_plot_by',
+                                            value=self.settings.plot_by,
+                                            style={'width': '150px'},
+                                        ),
+                                    ],
+                                    style=FLOATING_BOX_ROW_STYLE,
+                                ),
+                                html.Div(
+                                    [
+                                        dbc.Label("Mean res depth", html_for=self.id+'_mean_res', class_name="mb-0", style=FLOATING_BOX_LABEL_STYLE),
+                                        dbc.Select(
+                                            options=[{'label': 'Hidden', 'value': -1}] +
+                                                     [{'label': (str(d) if d == 0 else f'-{d}'), 'value': d} for d in range(0, 301, 10)],
+                                            value=self.settings.mean_res,
+                                            id=self.id+'_mean_res',
+                                            style={'width': '150px'},
+                                        ),
+                                    ],
+                                    style=FLOATING_BOX_ROW_STYLE,
+                                ),
+                            ],
                             style={
-                                'position': 'absolute',
-                                'bottom': '10px',
-                                'left': '50%',
-                                'transform': 'translateX(-50%)',
-                                'width': '150px'
-                            }
+                                'display': 'flex',
+                                'flexDirection': 'row',
+                                'justifyContent': 'center',
+                                'gap': '24px',
+                                'padding': '8px 0',
+                                'flexShrink': 0,
+                            },
                         ),
-
-                        dbc.Input(
-                            type='number',
-                            step=1,
-                            value=0,
-                            id=self.id+'_mean_res',
-                            style={
-                                'position': 'absolute',
-                                'bottom': '10px',
-                                'left': '75%',
-                                'transform': 'translateX(-50%)',
-                                'width': '150px'
-                            }                            
-                        )
                     ],
                     style={
                         'flex': '1',
                         'minHeight': 0,
-                        'position': 'relative',
-                        'display': 'flex'
+                        'display': 'flex',
+                        'flexDirection': 'column',
                     }
                 ),
                 gear_maker(self.id)
@@ -608,7 +1198,34 @@ class Map(Panel):
         )
 
     def make_grid(self):
-        self.grid = Grid(self.dataframe.latitude.values, self.dataframe.longitude.values, pixel_size=25., buffer_pixel=4)
+        self.grid = Grid(self.dataframe.latitude.values, self.dataframe.longitude.values,
+                          pixel_size=self.grid_pixel_size, buffer_pixel=self.grid_buffer_pixel)
+
+    def _ensure_grid(self):
+        """
+        (Re)build self.grid if it's missing or stale relative to the
+        current site set or grid_pixel_size/grid_buffer_pixel. Called from
+        render() so the mean-res grid self-heals whenever the site list
+        (or, e.g., report.py's temporary buffer override) has changed,
+        without needing make_grid() to be called externally first.
+        """
+        if self.dataframe is None or self.dataframe.empty:
+            return
+        grid_key = (len(self.dataframe), self.grid_pixel_size, self.grid_buffer_pixel)
+        if getattr(self, 'grid', None) is None or getattr(self, '_grid_key', None) != grid_key:
+            self.make_grid()
+            self._grid_key = grid_key
+
+    def _mean_res_z_new(self):
+        """
+        mean_res is the depth (in meters) at the top of a 10m band, chosen
+        from the dropdown's fixed 0/-10/-20/.../-300 options (displayed
+        negative to match an elevation-style "down is negative"
+        convention, stored as the positive depth). E.g. selecting "-20"
+        shows the mean resistivity of the 20-30m band.
+        """
+        depth = self.settings.mean_res
+        return np.array([depth, depth + 10], dtype=float)
 
     def add_callbacks(self, app):
         super().add_callbacks(app)
@@ -616,29 +1233,68 @@ class Map(Panel):
 
         @app.callback(
             self.output,
+            Output(self.id+'_mean_res', 'value', allow_duplicate=True),
+            # plot_by is also exposed as a field in the auto-generated gear
+            # settings form (basepanel.py's PanelSettings.render()), as a
+            # second control bound to the same underlying setting. That
+            # duplicate never hears about changes made via this dedicated
+            # dropdown, so it goes stale -- and Panel.add_callbacks'
+            # generic update_render callback writes EVERY gear-form
+            # field's *currently displayed* value back on any single
+            # field's change (they share one callback), which would
+            # silently stomp self.settings.plot_by back to the stale value
+            # the next time e.g. Data points size changes. Pushing the new
+            # value into the gear-form twin here keeps it from ever going
+            # stale in the first place. Same established pattern already
+            # used for model_section's x_axis field further down (see
+            # update_view). mean_res has no such twin -- it's in
+            # hidden_settings, so it never appears in the gear form at all.
+            Output({'type': f'settings-{self.id}', 'key': 'plot_by'}, 'value', allow_duplicate=True),
             Input(self.id+'_plot_by', 'value'),
             prevent_initial_call=True
         )
         def update_plotby(value):
-            if value not in self.dataframe.columns:
+            if value not in ('none', 'enabled_disabled') and value not in self.dataframe.columns:
                 raise PreventUpdate
             self.settings.plot_by = value
-            return self.render()  
-        
+            # Mean-res and plot_by (misfit/doi/date/enabled-disabled/line)
+            # each drive their own color and colorbar -- showing both at
+            # once is confusing and stacks two colorbars on the map. Only
+            # one can be active at a time, so switching one on turns the
+            # other off.
+            mean_res_value = no_update
+            if value != 'none' and self.settings.mean_res != -1:
+                self.settings.mean_res = -1
+                mean_res_value = -1
+            return self.render(), mean_res_value, value
+
         @app.callback(
             self.output,
+            Output(self.id+'_plot_by', 'value', allow_duplicate=True),
+            Output({'type': f'settings-{self.id}', 'key': 'plot_by'}, 'value', allow_duplicate=True),
             Input(self.id+'_mean_res', 'value'),
             prevent_initial_call=True
         )
         def update_mean_res(value):
-            self.settings.mean_res = value
-            m1_patch = Patch()
-            from __main__ import sesh
-            z_new = np.array([self.settings.mean_res, self.settings.mean_res+1])*10.
-            res_grid = np.log10(rediscretize(sesh.models, z_new))
-
-            m1_patch['data'][self._layers.index('meanres')]['z'] = self.grid.grid_values(res_grid)
-            return m1_patch
+            # dbc.Select/HTML <select> always yields the option value as a
+            # string, even though it was registered as an int.
+            self.settings.mean_res = int(value)
+            # See update_plotby above -- mean res and plot_by are mutually
+            # exclusive so only one colorbar is ever on screen.
+            plot_by_value = no_update
+            gear_plot_by_value = no_update
+            if self.settings.mean_res != -1 and self.settings.plot_by != 'none':
+                self.settings.plot_by = 'none'
+                plot_by_value = 'none'
+                gear_plot_by_value = 'none'
+            # A partial Patch() here previously only touched the trace's
+            # 'z' values and missed 'geojson'/'locations' entirely, so it
+            # silently did nothing whenever the on-screen trace was still
+            # the empty placeholder. render() is cheap and self-healing
+            # (see _ensure_grid) and, now that the map keeps a constant
+            # trace count on every render, a full re-render is just as
+            # safe as a Patch -- so return one, matching update_plotby.
+            return self.render(), plot_by_value, gear_plot_by_value
 
         @app.callback(
             self.output,
@@ -649,9 +1305,21 @@ class Map(Panel):
             prevent_initial_call=True
         )
         def update_view(relayout_data, options):
-            from __main__ import sesh
-            if 'map.center' in relayout_data:
-                self.settings.view = relayout_data
+            from __main__ import sesh, mod2, dbdt2
+            # A relayout event only carries the view keys that actually
+            # changed -- a wheel-zoom with no panning can arrive as just
+            # {'map.zoom': ..., 'map._derived': ...} with no 'map.center'
+            # at all. Gating on 'map.center' specifically meant zoom-only
+            # interactions never updated settings.view, so line2path() kept
+            # projecting drawn lines against a stale viewport bounding box
+            # (self.lat0/lat1/lon0/lon1, derived from map._derived) --
+            # exactly the "line drifts on zoom" symptom. Catch any map.*
+            # key instead, and merge into the existing view rather than
+            # replacing it outright, since a partial event shouldn't wipe
+            # out keys (center/bearing/pitch) it didn't actually report.
+            if any(k.startswith('map.') for k in relayout_data):
+                self.settings.view = {**(self.settings.view or {}),
+                                       **{k: v for k, v in relayout_data.items() if k.startswith('map.')}}
             elif 'dragmode' in relayout_data:
                 self.settings.dragmode=relayout_data['dragmode']
                 if self.settings.dragmode!='drawline':
@@ -680,11 +1348,26 @@ class Map(Panel):
                 elif len(relayout_data['shapes'])==len(self.lines.line.unique())-1:
                     saved_paths = [self.line2path(line_id)['path'] for line_id in self.lines.line.unique()]
                     remaining_paths = [shape['path'] for shape in relayout_data['shapes']]
+                    removed_line_ids = []
                     for line_id, path in zip(self.lines.line.unique(), saved_paths):
                         if path not in remaining_paths:
                             self.lines = self.lines[self.lines.line!=line_id]
+                            removed_line_ids.append(line_id)
                     sesh.lines = self.lines.copy()
                     sesh.update_site_table()
+                    # A panel left pointed at a just-erased line's x_axis
+                    # mode is a dangling reference: sesh.data/sesh.models
+                    # no longer have that line's _line_N_x/_line_N_y
+                    # projection columns (update_site_table() above just
+                    # recomputed them from the now-shorter sesh.lines), so
+                    # the next render/refresh crashes with a KeyError on
+                    # that column instead of just falling back cleanly.
+                    for removed_id in removed_line_ids:
+                        removed_option = f'line {removed_id:0.0f}'
+                        if mod2.settings.x_axis == removed_option:
+                            mod2.settings.x_axis = 'site_id'
+                        if dbdt2.settings.x_axis == removed_option:
+                            dbdt2.settings.x_axis = 'site_id'
             else:
                 key, value = list(relayout_data.items())[0]
                 if key.startswith('shapes[') and key.endswith('].path'):
@@ -723,45 +1406,47 @@ class Map(Panel):
             return result
         
 
-def rediscretize_matrix(z_old, z_new):
-    """this function rediscretizes values onto a new grid. if an interval on the new discretization spans several layers, the resulting average will be thickness averaged."""
-    if type(z_old) is tuple:
-        z_old1,z_old2 = z_old
-    elif isinstance(z_old, np.ndarray):
-        z_old1 = np.insert(z_old, 0,0)[:-1]
-        z_old2 = z_old*1
+def mean_resistivity_band(model_df, depth_top, depth_bottom):
+    """
+    Thickness-weighted mean resistivity of each site's layers overlapping
+    [depth_top, depth_bottom), computed directly from each row's own
+    top_depth/bottom_depth/resistivity.
 
-    if type(z_new) is tuple:
-        z_new1,z_new2 = z_new
-    elif isinstance(z_new, np.ndarray):
-        z_new1 = np.insert(z_new, 0,0)[:-1]
-        z_new2 = z_new*1
+    The previous implementation (rediscretize/rediscretize_matrix, removed)
+    pivoted resistivity into a site_id x center_depth matrix and combined
+    it with a shared overlap-weighting matrix via a single matrix multiply.
+    That silently assumed every site shares the same depth discretization.
+    Real inversions rarely do (variable layer counts, DOI-based
+    differences), so the pivot came out sparse/NaN almost everywhere, and
+    one NaN cell in a site's row wipes out that entire site's result via
+    ordinary matrix multiplication -- in practice every site came out NaN.
+    Computing directly from each row's own depths makes no such assumption;
+    a site only legitimately comes back NaN if none of its own layers
+    overlap the requested band (e.g. it doesn't extend that deep).
 
-    zo1,zn1 = np.meshgrid(z_old1, z_new1, indexing='ij')
-    zo2,zn2 = np.meshgrid(z_old2, z_new2, indexing='ij')
+    Also clipped to each site's own DOI, if present: a layer's effective
+    bottom is capped at min(its own bottom_depth, depth_bottom, doi), so a
+    band that starts below a site's DOI contributes nothing for that site
+    (NaN, same as not extending that deep at all -- the grid shows the
+    basemap through rather than an unreliable value), and a band straddling
+    the DOI boundary is thickness-weighted only over the portion above it,
+    so the last real value for a site fades out exactly at its DOI instead
+    of continuing on unchanged for another whole band.
 
-    ov1 = np.max(np.stack([zo1,zn1]), axis=0)
-    ov2 = np.min(np.stack([zo2,zn2]), axis=0)
-    ov = ov2-ov1
-    ov[ov<0] = 0
-
-    if z_new2[-1] > z_old2[-1]:
-        ov[-1, -1] = 1.
-    
-    ov /= ov.sum(0, keepdims=True)
-    
-    return ov
-
-def rediscretize(model_df, z_new):
-    d_top = model_df['top_depth'].unique()
-    d_bot = model_df['bottom_depth'].unique()
-    res_grid = model_df.pivot_table('resistivity', 'site_id', 'center_depth').values
-    # print(res_grid.shape)
-    # model_df=model_df[model_df.site_id.isin(res_grid.index)]
-    z_old = np.unique(np.concatenate((d_top[1:],d_bot)))
-    z_old.sort()
-    redisc_mat = np.nan_to_num(rediscretize_matrix(z_old, z_new))
-
-    if len(z_new)==2:
-        redisc_mat = redisc_mat[:, 1:].squeeze()
-    return res_grid @ redisc_mat
+    Returns a pandas Series of mean resistivity indexed by site_id.
+    """
+    band_bottom = np.minimum(model_df['bottom_depth'].values, depth_bottom)
+    if 'doi' in model_df.columns:
+        band_bottom = np.minimum(band_bottom, model_df['doi'].values)
+    overlap = np.clip(
+        band_bottom - np.maximum(model_df['top_depth'].values, depth_top),
+        0, None,
+    )
+    tmp = pd.DataFrame({
+        'site_id': model_df['site_id'].values,
+        'overlap': overlap,
+        'weighted': overlap * model_df['resistivity'].values,
+    })
+    grouped = tmp.groupby('site_id')[['overlap', 'weighted']].sum()
+    with np.errstate(invalid='ignore', divide='ignore'):
+        return grouped['weighted'] / grouped['overlap'].replace(0, np.nan)
