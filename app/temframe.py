@@ -25,20 +25,40 @@ def write_log(message):
 # --------------------------------------------------------------------------
 # Instrument identification
 # --------------------------------------------------------------------------
-# Each TEM system produces a characteristic pair of gate counts (low moment,
-# high moment). This is the same signature your original code already used
-# to accept/reject files -- now it also tells us WHICH instrument a file
-# came from, so files from different systems can be imported together
-# without their sweeps, gates, or forward models getting mixed up.
-SYSTEM_SIGNATURES = {
-    frozenset({6, 22}): 'sTEMprofiler',
-    frozenset({20, 27}): 'sTEM40x40',
-}
+# The instrument family comes from /LOOP_SIZE: the sTEM profiler uses a
+# small (3x3 m) loop, the sTEM 40x40 a 40x40 m loop. Any number of gates is
+# accepted, but the gate configuration (low/high moment gate counts) is
+# still part of the instrument name: gate times and waveform are baked into
+# each instrument's forward operators, and Session.merge_upload reuses the
+# existing forwards whenever an uploaded instrument name is already known.
+PROFILER_MAX_LOOP_SIDE = 10.  # m; larger loops are treated as sTEM40x40
 
 
-def identify_system(points_set):
-    """Map a set of sweep `.points` values to a known instrument name, or None."""
-    return SYSTEM_SIGNATURES.get(frozenset(points_set))
+def instrument_family(loop_size):
+    """'sTEMprofiler' or 'sTEM40x40' from a sweep's /LOOP_SIZE."""
+    return 'sTEMprofiler' if np.max(loop_size) <= PROFILER_MAX_LOOP_SIDE else 'sTEM40x40'
+
+
+def identify_system(sweeps):
+    """
+    Classify the sweeps of one USF file. Returns the instrument name, e.g.
+    'sTEMprofiler (21/29 gates)', or None if the file isn't made of
+    low + high moment pairs of a single instrument configuration.
+
+    Sweeps are paired in file order (one pair per sounding). Each sweep is
+    tagged with `.moment` (0 = low, 1 = high; the sweep with the earlier
+    first gate is the low moment), so the two moments can be told apart
+    even when they have the same number of gates.
+    """
+    if len(sweeps) == 0 or len(sweeps) % 2:
+        return None
+    names = set()
+    for pair in zip(sweeps[::2], sweeps[1::2]):
+        lm, hm = sorted(pair, key=lambda swp: np.nanmin(swp.time))
+        lm.moment, hm.moment = 0, 1
+        family = instrument_family(lm.loop_size)
+        names.add(f'{family} ({int(lm.points)}/{int(hm.points)} gates)')
+    return names.pop() if len(names) == 1 else None
 
 
 def overview(temdf):
@@ -199,11 +219,11 @@ def from_zip_content(zip_content):
         for fname in usf_files:
             with z.open(fname, 'r') as f:
                 new_sweeps = usf.Sweep.from_buffer(f, combine=False)
-                system_name = identify_system({x.points for x in new_sweeps})
+                system_name = identify_system(new_sweeps)
                 if system_name is not None:
                     sweeps_by_system.setdefault(system_name, []).extend(new_sweeps)
                 else:
-                    print(f'Ignoring {fname} because it does not contain both low and high moment data.')
+                    print(f'Ignoring {fname}: expected low + high moment sweep pairs, found {len(new_sweeps)} sweep(s).')
         return from_sweeps_multi(sweeps_by_system, folder_path=z.namelist()[0] + '.zip')
 
 def from_usf_folder(folder_path):
@@ -213,11 +233,11 @@ def from_usf_folder(folder_path):
         with open(usf_file, 'rb') as f:
             print(f'Processing {usf_file}...')
             new_sweeps = usf.Sweep.from_buffer(f, combine=False)
-            system_name = identify_system({x.points for x in new_sweeps})
+            system_name = identify_system(new_sweeps)
             if system_name is not None:
                 sweeps_by_system.setdefault(system_name, []).extend(new_sweeps)
             else:
-                print(f'Ignoring {usf_file} because it does not contain both low and high moment data.')
+                print(f'Ignoring {usf_file}: expected low + high moment sweep pairs, found {len(new_sweeps)} sweep(s).')
     return from_sweeps_multi(sweeps_by_system, folder_path=folder_path)
 
 
@@ -230,19 +250,25 @@ def _sweeps_to_df(sweeps, instrument_name, system_offset=0):
     for the second instrument) so that when multiple instruments are later
     concatenated, their gates never collide in 'sys_gate'/pivoted columns.
     """
+    # identify_system tags each sweep with .moment; fall back to grouping by
+    # gate count for sweeps that weren't classified (legacy from_sweeps)
+    if all(hasattr(swp, 'moment') for swp in sweeps):
+        group_key = lambda swp: swp.moment
+    else:
+        group_key = lambda swp: swp.points
+    groups = {}
+    for swp in sweeps:
+        groups.setdefault(group_key(swp), []).append(swp)
     points = sorted(set([x.points for x in sweeps]))
-    mega_sweeps = []
-    for pnts in points:
-        mega_sweeps.append(usf.Sweep.combine_sweeps([swp for swp in sweeps if swp.points == pnts]))
 
-    mega_sweeps = sorted(mega_sweeps, key=lambda swp: np.nanmin(swp.time))
-    try:
-        lm, hm = mega_sweeps
-    except ValueError:
+    if len(groups) != 2:
         raise ValueError(
-            f"Expected exactly 2 point-count groups (low + high moment) for "
-            f"'{instrument_name}', found {len(mega_sweeps)} (points={points})."
+            f"Expected exactly 2 sweep groups (low + high moment) for "
+            f"'{instrument_name}', found {len(groups)} (points={points})."
         )
+    lm_sweeps, hm_sweeps = sorted(groups.values(), key=lambda g: min(np.nanmin(swp.time) for swp in g))
+    lm = usf.Sweep.combine_sweeps(lm_sweeps)
+    hm = usf.Sweep.combine_sweeps(hm_sweeps)
 
     if lm.data.shape[0] != hm.data.shape[0]:
         raise ValueError(
@@ -311,7 +337,7 @@ def _sweeps_to_df(sweeps, instrument_name, system_offset=0):
     # (loop size, ramp, filters, etc.) unambiguous per system. Both the low
     # and high moment operators are kept (not merged) so the caller can
     # combine them with '+' exactly as before, e.g. Session.dmfwr.
-    forward_operators = usf.sweep2fwr(sweeps)
+    forward_operators = usf.sweep2fwr([lm_sweeps[0]]) + usf.sweep2fwr([hm_sweeps[0]])
     forward_operators[0].source     = forward_operators[1].source
     forward_operators[0].receiver   = forward_operators[1].receiver
     forward_operators[0].filterfunc = forward_operators[1].filterfunc
@@ -410,8 +436,7 @@ def from_sweeps(sweeps, folder_path=None):
     Detects the instrument automatically and delegates to from_sweeps_multi.
     Returns the same (df_data, forwards, instrument_names) tuple.
     """
-    points_set = {x.points for x in sweeps}
-    instrument_name = identify_system(points_set) or 'unknown'
+    instrument_name = identify_system(sweeps) or 'unknown'
     return from_sweeps_multi({instrument_name: sweeps}, folder_path=folder_path)
 
 def disable(temdf, data_ids):

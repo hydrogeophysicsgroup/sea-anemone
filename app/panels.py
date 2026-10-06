@@ -428,6 +428,8 @@ class dbdtSectionSettings(PanelSettings):
     y_axis: str = field(default='dbdt_syn', metadata={'title': 'y axis'})
     lm_factor: float = field(default=20.0, metadata={'title': 'LM factor'})
     hm_factor: float = field(default=1.0, metadata={'title': 'HM factor'})
+    show_lm: bool = field(default=True, metadata={'title': 'Show LM'})
+    show_hm: bool = field(default=True, metadata={'title': 'Show HM'})
     plot_disabled: bool = field(default=True, metadata={'title': 'Plot Disabled'})
     dbdt_min: float = field(default=-12, metadata={'title': 'dbdt min'})
     dbdt_max: float = field(default=-3, metadata={'title': 'dbdt max'})
@@ -526,9 +528,14 @@ class dbdtSection(Panel):
         xmin-= 0.1*dx
         return xmin,xmax
 
+    def _visible_moments(self, df):
+        """Keep only the LM (even system_id) / HM (odd) rows ticked in the gear menu."""
+        is_lm = df['system_id'] % 2 == 0
+        return df[(is_lm & self.settings.show_lm) | (~is_lm & self.settings.show_hm)]
+
     def compare_synthetic(self):
         y_axis                                             = self.settings.y_axis
-        df_tmp, x_axis, _ = self._prepare_x_axis(self.dataframe.copy())
+        df_tmp, x_axis, _ = self._prepare_x_axis(self._visible_moments(self.dataframe).copy())
         df_tmp                                             = df_tmp.sort_values(['gate_id', x_axis])
         df_tmp['include'] = df_tmp['inuse_manual'].astype(bool, copy=False).fillna(df_tmp['inuse_auto'])
 
@@ -662,7 +669,7 @@ class dbdtSection(Panel):
 
     def observed_by_gate_id(self):
         y_axis                                             = self.settings.y_axis
-        df_tmp, x_axis, _ = self._prepare_x_axis(self.dataframe.copy())
+        df_tmp, x_axis, _ = self._prepare_x_axis(self._visible_moments(self.dataframe).copy())
         df_tmp                                             = df_tmp.sort_values(['gate_id', x_axis])
         df_tmp['include'] = df_tmp['inuse_manual'].astype(bool, copy=False).fillna(df_tmp['inuse_auto']).astype(bool)
         # lm_factor = compute_lm_scaling(self.dataframe, self.settings.lm_factor)
@@ -737,6 +744,9 @@ class dbdtSection(Panel):
             x_min = None
             x_max = None
 
+        if self._visible_moments(self.dataframe).empty:
+            return _no_data_figure("Tick 'Show LM' and/or 'Show HM' in the settings")
+
         if self.settings.y_axis=='gate_id':
             return self.observed_by_gate_id()
 
@@ -778,13 +788,16 @@ class dbdtSection(Panel):
                     line=dict(color="rgba(0,0,0,0.8)", width=1.5),
                     fillcolor="rgba(0,0,0,0.0)",
                 )
-        vals = np.abs(self.dataframe["dbdt"].values)
+        # y-range from the visible moments only, with their LM/HM factors applied
+        df_visible = self._visible_moments(self.dataframe)
+        factor = np.where(df_visible['system_id'] % 2 == 0, self.settings.lm_factor, self.settings.hm_factor)
+        vals = np.abs(df_visible["dbdt"].values * factor)
         vals = vals[np.isfinite(vals) & (vals > 0)]
 
         if len(vals) > 0:
             logvals = np.log10(vals)
             ymin = np.floor(logvals.min()) - 0.2
-            ymax = np.ceil(logvals.max()) + 0.2 + np.log10(self.settings.lm_factor)
+            ymax = np.ceil(logvals.max()) + 0.2
         else:
             ymin, ymax = -12, -3
 

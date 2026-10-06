@@ -235,7 +235,10 @@ class Grid:
         coordinates_lat, coordinates_lon = utm.to_latlon(coordinates_x, coordinates_y, self.zone, self.letter)
 
         tree = cKDTree(self.points_xy)
-        self.mesh_dists, self.mesh_idxs = tree.query(mesh_points, k=6)
+        # k can't exceed the number of sites (missing neighbours come back as
+        # index n / dist inf); a list k keeps the result 2D even for k=1
+        k = min(6, len(self.points_xy))
+        self.mesh_dists, self.mesh_idxs = tree.query(mesh_points, k=list(range(1, k+1)))
 
         features = []
         ids = []
@@ -257,7 +260,7 @@ class Grid:
         print('n_pixels:', len(self.mesh_points))
 
     def grid_values(self, z_data):
-        weight = 1./self.mesh_dists
+        weight = 1./np.maximum(self.mesh_dists, 1e-6)  # pixel centred on a site
         weight /= weight.sum(axis=1, keepdims=True)
         z_mesh = weight[:, 0] * z_data[self.mesh_idxs[:, 0]]
         for i in range(1, self.mesh_idxs.shape[1]):
@@ -1326,13 +1329,17 @@ class Map(Panel):
                     sesh.update_site_table()
 
             elif 'shapes' in relayout_data:
-                if relayout_data['shapes'][-1]['type']=='line':
-                    
+                # Erasing the only remaining line sends an empty shapes list,
+                # so check for emptiness before peeking at the last shape.
+                if relayout_data['shapes'] and relayout_data['shapes'][-1]['type']=='line':
+
                     lat0,lon0 = self.paper2latlon(relayout_data['shapes'][-1]['x0'], relayout_data['shapes'][-1]['y0'])
                     lat1,lon1 = self.paper2latlon(relayout_data['shapes'][-1]['x1'], relayout_data['shapes'][-1]['y1'])
                     line_id = 1
                     node = 0
-                    if self.lines is None:
+                    # self.lines is left as an empty DataFrame after all
+                    # lines have been erased, so treat that like None.
+                    if self.lines is None or self.lines.empty:
                         self.lines = DataFrame({'latitude':[lat0], 'longitude':[lon0], 'line':[line_id], 'node':[node], 'length':[-1], 'total_length':[-1], 'radius':[100]})
                     else:
                         lat, lon, line_id, node, _, __, ___ = self.lines.loc[len(self.lines)-1].tolist()
@@ -1345,7 +1352,7 @@ class Map(Panel):
                     sesh.lines = self.lines.copy()
                     sesh.update_site_table()
                     fig=self.render()
-                elif len(relayout_data['shapes'])==len(self.lines.line.unique())-1:
+                elif self.lines is not None and len(relayout_data['shapes'])==len(self.lines.line.unique())-1:
                     saved_paths = [self.line2path(line_id)['path'] for line_id in self.lines.line.unique()]
                     remaining_paths = [shape['path'] for shape in relayout_data['shapes']]
                     removed_line_ids = []
