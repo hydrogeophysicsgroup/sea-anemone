@@ -9,8 +9,8 @@ import requests
 import utm
 from PIL import Image
 
-from map import Grid, mean_resistivity_band
-from model import RESISTIVITY_COLORSCALE, resistivity_colorbar_tick_kwargs
+from map import Grid, mean_resistivity_band, available_mean_res_depths
+from model import RESISTIVITY_COLORSCALE, resistivity_colorbar_tick_kwargs, utm_zone_label
 
 
 @nosj
@@ -25,7 +25,9 @@ class Model3DSettings(PanelSettings):
     line_width: float = 8.0
     box_half_width: float = 4.0
     vertical_exaggeration: float = 1.0
-    mask_below_doi: bool = False
+    # On by default: layers below the DOI are hidden rather than drawn as a
+    # faded second trace. Untick to bring them back at below_doi_opacity.
+    mask_below_doi: bool = True
     below_doi_opacity: float = 0.15
     show_boreholes: bool = True
     show_legend: bool = False
@@ -81,6 +83,30 @@ class Model3D(Panel):
         self._map_layer_cache = {}
         for key, value in kwargs.items():
             setattr(self, key, value)
+
+    def add_callbacks(self, app):
+        super().add_callbacks(app)
+
+        @app.callback(
+            Output({'type': f'settings-{self.id}', 'key': 'mean_res_depth'}, 'options'),
+            Input(self.id, 'figure'),
+        )
+        def update_mean_res_depth_options(_):
+            # Only offer depth bands that actually have values for at
+            # least one site (same check as the 2D map's dropdown and the
+            # report's mean-res appendix). The currently selected depth
+            # stays in the list so the select never shows a blank value.
+            from __main__ import sesh
+            site_df = self._mean_res_site_df()
+            if site_df is None:
+                depths = []
+            else:
+                grid = self._ensure_mean_res_grid(site_df)
+                depths = available_mean_res_depths(sesh.models, grid, site_df['site_id'].values)
+            current = abs(int(self.settings.mean_res_depth))
+            if current not in depths:
+                depths = sorted(depths + [current])
+            return [{'label': str(-d), 'value': -d} for d in depths]
 
     def _project_latlon(self, lat, lon):
         lat = np.asarray(lat, dtype=float)
@@ -207,6 +233,14 @@ class Model3D(Panel):
             name='Basemap',
             showlegend=False,
         )
+
+    def _mean_res_site_df(self):
+        """One row per site (site_id, lat, lon, elevation) for the mean-res grid, or None without data."""
+        if self.dataframe is None or self.dataframe.empty:
+            return None
+        site_df = (self.dataframe.dropna(subset=['latitude', 'longitude'])
+                   .drop_duplicates('site_id')[['site_id', 'latitude', 'longitude', 'elevation']])
+        return site_df if not site_df.empty else None
 
     def _ensure_mean_res_grid(self, site_df):
         """
@@ -354,9 +388,21 @@ class Model3D(Panel):
         faces = (local_faces[None, :, :] + offsets).reshape(-1, 3)
         i, j, k = faces[:, 0], faces[:, 1], faces[:, 2]
 
+        # Real elevation/depth of the layer (not the vertically exaggerated
+        # plot z), plus the site's UTM position.
+        elev = df['elevation'].values if 'elevation' in df.columns else np.full(n, np.nan)
+        elev_top = elev - df['top_depth'].values
+        elev_bottom = elev - df['bottom_depth'].values
+        zone_label = utm_zone_label(df['latitude'].values, df['longitude'].values)
         hover_per_box = [
-            f"Site {s}<br>Layer {l}<br>ρ = {r:.1f} Ω·m"
-            for s, l, r in zip(df['site_id'], df['layer'], df['resistivity'])
+            f"Site {s}<br>"
+            f"Elevation: {et:.1f} to {eb:.1f} m<br>"
+            f"Depth: {dt:.1f} to {db:.1f} m below surface<br>"
+            f"UTM{zone_label}: {ux:.0f} E, {uy:.0f} N<br>"
+            f"ρ = {r:.1f} Ω·m"
+            for s, et, eb, dt, db, ux, uy, r in zip(
+                df['site_id'], elev_top, elev_bottom, df['top_depth'], df['bottom_depth'],
+                df['_utm_x'], df['_utm_y'], df['resistivity'])
         ]
         hovertext = np.repeat(hover_per_box, 8)
 
@@ -429,8 +475,8 @@ class Model3D(Panel):
                 fig.add_trace(map_trace)
 
         if self.settings.show_mean_res_layer:
-            site_df = df.drop_duplicates('site_id')[['site_id', 'latitude', 'longitude', 'elevation']]
-            mean_res_trace = self._get_mean_res_layer_trace(site_df, z_mode, ve)
+            site_df = self._mean_res_site_df()
+            mean_res_trace = self._get_mean_res_layer_trace(site_df, z_mode, ve) if site_df is not None else None
             if mean_res_trace is not None:
                 fig.add_trace(mean_res_trace)
 
@@ -453,8 +499,10 @@ class Model3D(Panel):
                 x=top_df['_utm_x'], y=top_df['_utm_y'], z=top_df['_z_top'],
                 mode='markers',
                 marker=dict(size=1.5, color='black'),
-                customdata=top_df[['site_id']].values,
-                hovertemplate='Site %{customdata[0]}<extra></extra>',
+                customdata=top_df[['site_id', '_utm_x', '_utm_y']].values,
+                hovertemplate=('Site %{customdata[0]}<br>'
+                               f'UTM{utm_zone_label(top_df["latitude"].values, top_df["longitude"].values)}: '
+                               '%{customdata[1]:.0f} E, %{customdata[2]:.0f} N<extra></extra>'),
                 name='Sites',
                 showlegend=False,
             ))

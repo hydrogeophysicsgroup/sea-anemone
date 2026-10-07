@@ -14,6 +14,10 @@ import numpy as np
 import os
 from anemone.inversion import LogResistivity
 
+# Constraint values behind the Loose/Medium/Tight buttons.
+VERTICAL_CONSTRAINTS = {"loose": 2.0, "medium": 0.8, "tight": 0.2}
+HORIZONTAL_CONSTRAINTS = {"loose": 0.6, "medium": 0.3, "tight": 0.1}
+
 @nosj
 class MultiInversionSettings(PanelSettings):
     line_color: str='#ff0000'
@@ -277,44 +281,7 @@ class MultiInversion(Panel):
         )
 
         def update_misfit(n_intervals):
-            log_time_value = None
-            elapsed_seconds = n_intervals
-            minutes, seconds = divmod(elapsed_seconds, 60)
-            timer_text = f"Elapsed time: {int(minutes)}:{int(seconds):02d}"
-            self.iterations = []
-            self.misfit = []
-            from __main__ import sesh
-
-            for line in getattr(sesh, 'inv_status', []):
-                if not line.strip():
-                    continue  # skip empty lines
-
-                parts = line.split()
-
-                # Iteration number is the first token
-                if not parts[0].isdigit():
-                    continue  # skip lines that don't start with an iteration number
-                iteration = int(parts[0])
-
-                # Find "Total misfit:" and take the number after it
-                total_misfit_index = parts.index("Total") + 2
-                total_misfit = float(parts[total_misfit_index])
-
-                self.iterations.append(iteration)
-                self.misfit.append(total_misfit)
-
-                if "Last" in parts:
-                    last_index = parts.index("Last")
-                    target_index = last_index + 3
-                    if target_index < len(parts):
-                        log_time_value = parts[target_index]
-
-            timer_text = f"Elapsed time: {int(minutes)}:{int(seconds):02d}"
-            if log_time_value is not None:
-                timer_text += f"\nLast iteration: {log_time_value} s"
-            if self.current_instrument_label is not None:
-                timer_text = f"{self.current_instrument_label}\n{timer_text}"
-            return self.render(), timer_text
+            return self.poll_inversion_status(n_intervals)
         @app.callback(
             Output("starting_model", "figure"),
             Input("starting-model", "data"),
@@ -350,7 +317,8 @@ class MultiInversion(Panel):
             State("hc-level", "data"),
             State("starting-model", "data"),
             running=[(Output("invert_all_button", "disabled"), True, False),
-            (Output("invert_selected_button", "disabled"), True, False), 
+            (Output("invert_default_button", "disabled"), True, False),
+            (Output("invert_selected_button", "disabled"), True, False),
             (Output("inv-log-poll", "disabled"), False, True),    
             (Output("vc_loose_button", "disabled"), True, False),
             (Output("vc_medium_button", "disabled"), True, False),
@@ -362,57 +330,8 @@ class MultiInversion(Panel):
             prevent_initial_call=True
         )
         def launch_inversion(n_clicks, current_review_clicks, vc_level,hc_level,starting_model):
-            from __main__ import sesh,m1
             if n_clicks:
-                from torch import from_numpy, tensor
-                print('starting model:', starting_model["rho"])
-
-                if vc_level == "loose":
-                    Vert = 2.0
-                elif vc_level == "medium":
-                    Vert = 0.8
-                elif vc_level == "tight":
-                    Vert = 0.2
-
-                if hc_level == "loose":
-                    Horz = 0.6
-                elif hc_level == "medium":
-                    Horz = 0.3
-                elif hc_level == "tight":
-                    Horz = 0.1
-
-                if 'instrument' in sesh.data.columns:
-                    instruments = sesh.data['instrument'].unique()
-                else:
-                    instruments = [None]
-
-                df_layers_list, df_data_list = [], []
-                for idx, instrument in enumerate(instruments):
-                    if instrument is None:
-                        df_inst = sesh.data
-                        self.current_instrument_label = None
-                    else:
-                        df_inst = sesh.data[sesh.data['instrument'] == instrument]
-                        self.current_instrument_label = f"Inverting {instrument} ({idx+1}/{len(instruments)})"
-
-                    rho = tensor(starting_model["rho"]).repeat(len(starting_model["depth"]))
-                    depth = self.build_depth_from_loop(time=df_inst['time'].max())
-                    z   = tensor(depth[:-1])
-                    res_start = LogResistivity.smooth(rho,z)
-
-                    df_layers_inst, df_data_inst, _ = temframe.invert(
-                        df_inst, sesh.dmfwr_for(instrument), res_start, vc=Vert, hc=Horz
-                    )
-                    df_layers_list.append(df_layers_inst)
-                    df_data_list.append(df_data_inst)
-
-                self.current_instrument_label = None
-                sesh.models = pd.concat(df_layers_list, ignore_index=True)
-                sesh.data = pd.concat(df_data_list, ignore_index=True)
-                sesh.update_site_table()
-                m1.dataframe = sesh.site.copy()
-                self.title = "Inversion Finished"
-                new_review_clicks = (current_review_clicks or 0) + 1
+                self.run_inversion(VERTICAL_CONSTRAINTS[vc_level], HORIZONTAL_CONSTRAINTS[hc_level], starting_model)
                 return False, False, self.render(), "success","misfit"
             raise PreventUpdate
         
@@ -530,6 +449,93 @@ class MultiInversion(Panel):
         
 
 
+    def run_inversion(self, Vert, Horz, starting_model):
+        """
+        Spatially constrained inversion of all data, one instrument at a
+        time, with vertical/horizontal constraint values Vert/Horz and the
+        given starting model. Stores the results on sesh and refreshes the
+        map's site table. Shared by the default "Inversion" tab
+        (SimpleInversion) and the "Advanced inversion" tab.
+        """
+        from __main__ import sesh, m1
+        from torch import tensor
+        print('starting model:', starting_model["rho"])
+
+        if 'instrument' in sesh.data.columns:
+            instruments = sesh.data['instrument'].unique()
+        else:
+            instruments = [None]
+
+        df_layers_list, df_data_list = [], []
+        for idx, instrument in enumerate(instruments):
+            if instrument is None:
+                df_inst = sesh.data
+                self.current_instrument_label = None
+            else:
+                df_inst = sesh.data[sesh.data['instrument'] == instrument]
+                self.current_instrument_label = f"Inverting {instrument} ({idx+1}/{len(instruments)})"
+
+            rho = tensor(starting_model["rho"]).repeat(len(starting_model["depth"]))
+            depth = self.build_depth_from_loop(time=df_inst['time'].max())
+            z   = tensor(depth[:-1])
+            res_start = LogResistivity.smooth(rho,z)
+
+            df_layers_inst, df_data_inst, _ = temframe.invert(
+                df_inst, sesh.dmfwr_for(instrument), res_start, vc=Vert, hc=Horz
+            )
+            df_layers_list.append(df_layers_inst)
+            df_data_list.append(df_data_inst)
+
+        self.current_instrument_label = None
+        sesh.models = pd.concat(df_layers_list, ignore_index=True)
+        sesh.data = pd.concat(df_data_list, ignore_index=True)
+        sesh.update_site_table()
+        m1.dataframe = sesh.site.copy()
+        self.title = "Inversion Finished"
+
+    def poll_inversion_status(self, n_intervals):
+        """
+        Parse sesh.inv_status (the running inversion's log) into
+        self.iterations/self.misfit and return (figure, timer text) for
+        the inv-log-poll callback.
+        """
+        log_time_value = None
+        minutes, seconds = divmod(n_intervals, 60)
+        self.iterations = []
+        self.misfit = []
+        from __main__ import sesh
+
+        for line in getattr(sesh, 'inv_status', []):
+            if not line.strip():
+                continue  # skip empty lines
+
+            parts = line.split()
+
+            # Iteration number is the first token
+            if not parts[0].isdigit():
+                continue  # skip lines that don't start with an iteration number
+            iteration = int(parts[0])
+
+            # Find "Total misfit:" and take the number after it
+            total_misfit_index = parts.index("Total") + 2
+            total_misfit = float(parts[total_misfit_index])
+
+            self.iterations.append(iteration)
+            self.misfit.append(total_misfit)
+
+            if "Last" in parts:
+                last_index = parts.index("Last")
+                target_index = last_index + 3
+                if target_index < len(parts):
+                    log_time_value = parts[target_index]
+
+        timer_text = f"Elapsed time: {int(minutes)}:{int(seconds):02d}"
+        if log_time_value is not None:
+            timer_text += f"\nLast iteration: {log_time_value} s"
+        if self.current_instrument_label is not None:
+            timer_text = f"{self.current_instrument_label}\n{timer_text}"
+        return self.render(), timer_text
+
     @classmethod
     def standard(cls, misfit=None, rho=10.):
         return cls(data=misfit, rho=rho)
@@ -541,6 +547,120 @@ class MultiInversion(Panel):
         elif time >0.005:
             depth = np.cumsum(np.logspace(0, 1.8, 31)).tolist()
         return depth
+
+
+class SimpleInversion(MultiInversion):
+    """
+    The Invert step's default tab: the same starting-model plot as the
+    advanced tab (drag the dashed line to set the starting resistivity)
+    and a single "Invert" button that always uses medium vertical and
+    medium horizontal constraints. Custom constraints live in the
+    "Advanced inversion" tab (MultiInversion).
+    """
+    def __init__(self, dataframe, rho=10., **kwargs):
+        self.starting_rho = rho
+        self.title = "Inversion"
+        settings = MultiInversionSettings(id='simple_inv', **kwargs)
+        Panel.__init__(self, id='simple_inv', settings=settings)
+        self.dataframe = dataframe
+
+    def initialize(self):
+        return html.Div([
+            dbc.Container([
+                dbc.Row([
+                    dbc.Col(
+                        dcc.Graph(figure=self.render_init(), id=self.id, mathjax=True,
+                                  config=dict(edits={'shapePosition': True}, displayModeBar=False)),
+                        width=10),
+                    dbc.Col([
+                        dbc.Button("Invert", id='invert_default_button', color='primary', size='lg', style={'width': '100%'}),
+                        html.Div(style={'height': '10px'}),
+                        html.Div("Default settings: medium vertical and medium lateral constraints. "
+                                 "Drag the dashed line to change the starting model. "
+                                 "Use the Advanced inversion tab for other constraints.",
+                                 style={'fontSize': '13px', 'color': '#6c757d'}),
+                        html.Div(style={'height': '30px'}),
+                        dbc.Button("Starting model", id='reset_simple_model_button', color='secondary', style={'width': '100%'}),
+                        html.Div(style={'height': '40px'}),
+                        html.Div("Elapsed time: 0:00", id="simple-inv-timer", style={"fontWeight": "bold", "whiteSpace": "pre-line"}),
+                    ], width=2),
+                    dbc.Tooltip('Inverts all data with medium spatial constraints and the starting model shown.', target='invert_default_button'),
+                    dbc.Tooltip('Reset to starting model', target='reset_simple_model_button'),
+                ], style={'height': '100%'})
+            ], style={'height': '95%', 'padding': '25px'}),
+            gear_maker(self.id),
+        ], style={'height': '100%', 'overflow': 'hidden'})
+
+    def add_callbacks(self, app):
+        # Only the base Panel callbacks (settings gear) -- MultiInversion's
+        # own callbacks are bound to the advanced tab's component ids.
+        Panel.add_callbacks(self, app)
+
+        @app.callback(
+            Output(self.id, 'figure', allow_duplicate=True),
+            Output("simple-inv-timer", "children"),
+            Input('inv-log-poll', 'n_intervals'),
+            prevent_initial_call=True
+        )
+        def update_misfit(n_intervals):
+            return self.poll_inversion_status(n_intervals)
+
+        @app.callback(
+            Output(self.id, 'figure', allow_duplicate=True),
+            Input('invert_layout', 'n_clicks'),
+            prevent_initial_call=True
+        )
+        def refresh_on_invert_tab(_):
+            # Picks up newly uploaded/loaded data for the sounding curve.
+            return self.render()
+
+        @app.callback(
+            Output(self.id, 'figure', allow_duplicate=True),
+            Output("starting-model", "data", allow_duplicate=True),
+            Input("reset_simple_model_button", "n_clicks"),
+            State("starting-model", "data"),
+            prevent_initial_call=True
+        )
+        def reset_model(n_clicks, starting_model):
+            self.starting_rho = 10.
+            self.misfit = None
+            self.title = "Inversion"
+            starting_model["rho"] = self.starting_rho
+            return self.render_init(), starting_model
+
+        @app.callback(
+            Output(self.id, 'figure', allow_duplicate=True),
+            Input(self.id, 'relayoutData'),
+            prevent_initial_call=True
+        )
+        def update_starting_model(relayoutData):
+            # The starting-model store itself is updated by app.py's
+            # update_starting_model_from_simple_drag; this just redraws.
+            if relayoutData is None or "shapes[0].x0" not in relayoutData:
+                raise PreventUpdate
+            self.starting_rho = float(relayoutData["shapes[0].x0"])
+            self.misfit = None
+            return self.render_init()
+
+        @app.callback(
+            Output('review_layout', 'disabled', allow_duplicate=True),
+            Output('interpret_layout', 'disabled', allow_duplicate=True),
+            Output(self.id, "figure", allow_duplicate=True),
+            Output("review_layout", "color", allow_duplicate=True),
+            Output("map_plot_by", 'value', allow_duplicate=True),
+            Input('invert_default_button', 'n_clicks'),
+            State("starting-model", "data"),
+            running=[(Output("invert_default_button", "disabled"), True, False),
+                     (Output("invert_all_button", "disabled"), True, False),
+                     (Output('reset_simple_model_button', "disabled"), True, False),
+                     (Output("inv-log-poll", "disabled"), False, True)],
+            prevent_initial_call=True
+        )
+        def launch_default_inversion(n_clicks, starting_model):
+            if not n_clicks:
+                raise PreventUpdate
+            self.run_inversion(VERTICAL_CONSTRAINTS['medium'], HORIZONTAL_CONSTRAINTS['medium'], starting_model)
+            return False, False, self.render(), "success", "misfit"
 
 @nosj
 class SinglesiteSettings(PanelSettings):

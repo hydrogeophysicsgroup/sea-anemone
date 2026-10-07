@@ -260,11 +260,24 @@ class Grid:
         print('n_pixels:', len(self.mesh_points))
 
     def grid_values(self, z_data):
+        """
+        Inverse-distance blend of each pixel's nearest sites, skipping
+        sites without a value (NaN, e.g. a mean-res band below that site's
+        DOI or model depth). A pixel is only coloured if its NEAREST site
+        has a value, so the area around a shallow site still shows the
+        basemap at depths it doesn't reach, while a deep site keeps its
+        own colour. Previously one NaN neighbour blanked the pixel, so a
+        few shallow sites could hide a deep site's values everywhere.
+        """
+        z_data = np.asarray(z_data, dtype=float)
+        values = z_data[self.mesh_idxs]
+        has_value = np.isfinite(values)
         weight = 1./np.maximum(self.mesh_dists, 1e-6)  # pixel centred on a site
-        weight /= weight.sum(axis=1, keepdims=True)
-        z_mesh = weight[:, 0] * z_data[self.mesh_idxs[:, 0]]
-        for i in range(1, self.mesh_idxs.shape[1]):
-            z_mesh += weight[:, i] * z_data[self.mesh_idxs[:, i]]
+        weight = np.where(has_value, weight, 0.)
+        total = weight.sum(axis=1)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            z_mesh = (weight * np.where(has_value, values, 0.)).sum(axis=1) / total
+        z_mesh[~has_value[:, 0]] = np.nan
         return z_mesh
     
     def graph_object(self, z_data, **kwargs):
@@ -1163,8 +1176,7 @@ class Map(Panel):
                                     [
                                         dbc.Label("Mean res depth", html_for=self.id+'_mean_res', class_name="mb-0", style=FLOATING_BOX_LABEL_STYLE),
                                         dbc.Select(
-                                            options=[{'label': 'Hidden', 'value': -1}] +
-                                                     [{'label': (str(d) if d == 0 else f'-{d}'), 'value': d} for d in range(0, 301, 10)],
+                                            options=self._mean_res_options(),
                                             value=self.settings.mean_res,
                                             id=self.id+'_mean_res',
                                             style={'width': '150px'},
@@ -1230,8 +1242,42 @@ class Map(Panel):
         depth = self.settings.mean_res
         return np.array([depth, depth + 10], dtype=float)
 
+    def available_mean_res_depths(self):
+        """Depth bands whose mean-res layer colours at least one pixel of this map's grid."""
+        try:
+            from __main__ import sesh
+            models = sesh.models
+        except ImportError:
+            return []
+        if models is None or models.empty or self.dataframe is None or self.dataframe.empty:
+            return []
+        self._ensure_grid()
+        return available_mean_res_depths(models, getattr(self, 'grid', None), self.dataframe['site_id'].values)
+
+    def _mean_res_options(self):
+        """
+        'Hidden' plus only the depth bands that have mean-res values for at
+        least one site (see available_mean_res_depths). The current
+        selection is always kept so the select never shows a blank value.
+        """
+        depths = self.available_mean_res_depths()
+        current = int(self.settings.mean_res)
+        if current != -1 and current not in depths:
+            depths = sorted(depths + [current])
+        return ([{'label': 'Hidden', 'value': -1}] +
+                [{'label': (str(d) if d == 0 else f'-{d}'), 'value': d} for d in depths])
+
     def add_callbacks(self, app):
         super().add_callbacks(app)
+
+        @app.callback(
+            Output(self.id+'_mean_res', 'options'),
+            Input(self.id, 'figure'),
+        )
+        def update_mean_res_options(_):
+            # Re-checked whenever the map re-renders, which covers new
+            # inversion results and loaded sessions.
+            return self._mean_res_options()
 
 
         @app.callback(
@@ -1412,6 +1458,34 @@ class Map(Panel):
                     result = x_axis
             return result
         
+
+MEAN_RES_DEPTHS = list(range(0, 301, 10))
+
+
+def available_mean_res_depths(model_df, grid, site_ids, depths=MEAN_RES_DEPTHS):
+    """
+    The subset of `depths` (tops of 10m bands) whose mean-res layer would
+    actually colour at least one pixel of `grid` -- used to keep empty
+    bands out of the mean-res dropdowns and the report.
+
+    Checks the gridded pixels rather than the per-site values, so the
+    dropdowns always agree with what Grid.grid_values() actually draws.
+    site_ids must be in the same order as the points `grid` was built
+    from. Returns [] when there are no models.
+    """
+    if model_df is None or model_df.empty or grid is None:
+        return []
+    site_ids = np.asarray(site_ids)
+    available = []
+    for d in depths:
+        band = mean_resistivity_band(model_df, float(d), float(d) + 10.0)
+        if not band.notna().any():
+            continue
+        values = band.reindex(site_ids).values
+        if np.isfinite(grid.grid_values(values)).any():
+            available.append(d)
+    return available
+
 
 def mean_resistivity_band(model_df, depth_top, depth_bottom):
     """

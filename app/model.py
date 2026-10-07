@@ -20,6 +20,35 @@ def _no_data_figure(message):
     return fig
 
 
+def latlon_to_utm(lat, lon):
+    """
+    UTM easting/northing arrays for lat/lon arrays, NaN where either input
+    is missing. Uses one zone for all points (the utm package picks it from
+    the input), which is what a single survey area needs.
+    """
+    import utm
+    lat = np.asarray(lat, dtype=float)
+    lon = np.asarray(lon, dtype=float)
+    easting = np.full(len(lat), np.nan)
+    northing = np.full(len(lat), np.nan)
+    ok = np.isfinite(lat) & np.isfinite(lon)
+    if ok.any():
+        easting[ok], northing[ok], _, _ = utm.from_latlon(lat[ok], lon[ok])
+    return easting, northing
+
+
+def utm_zone_label(lat, lon):
+    """' 32V'-style zone suffix for hover labels, or '' if no valid point."""
+    import utm
+    lat = np.asarray(lat, dtype=float)
+    lon = np.asarray(lon, dtype=float)
+    ok = np.isfinite(lat) & np.isfinite(lon)
+    if not ok.any():
+        return ''
+    _, _, zone, letter = utm.from_latlon(float(np.mean(lat[ok])), float(np.mean(lon[ok])))
+    return f' {zone}{letter}'
+
+
 def _log_colorbar_ticks(vmin, vmax):
     """
     Nice round Ωm values (1/2/5 per decade -- 1, 2, 5, 10, 20, 50, ...)
@@ -117,6 +146,15 @@ class ModelGraph(Panel):
         ).sort_values(['site_id', 'daytime', 'layer', 'depth'])
 
         df_layers_long = df_layers_long.drop(columns=['depth_type'])
+        utm_e, utm_n = latlon_to_utm(df_layers_long['latitude'].values, df_layers_long['longitude'].values)
+        df_layers_long['utm_e'] = utm_e
+        df_layers_long['utm_n'] = utm_n
+        zone_label = utm_zone_label(df_layers_long['latitude'].values, df_layers_long['longitude'].values)
+        hovertemplate = (
+            "Site: %{customdata[0]}<br>"
+            f"UTM{zone_label}: %{{customdata[1]:.0f}} E, %{{customdata[2]:.0f}} N<br>"
+            "ρ: %{x:.1f} Ω·m<br>Depth: %{y:.1f} m<extra></extra>"
+        )
 
         if self.highlighted is None:
             heatmap_df = df_layers_long.set_index('site_id').sort_index(ascending=True)
@@ -148,8 +186,10 @@ class ModelGraph(Panel):
                     "resistivity": "ρ [Ω·m]",  # Unicode rho
                     "site_id": "Site ID"
                 },
+                custom_data=['site_id', 'utm_e', 'utm_n'],
                 title="1D Resistivity Profile",
             )
+            fig.update_traces(hovertemplate=hovertemplate)
         else:
             fig = go.Figure(layout=dict(title="1D Resistivity Profile"))
             # self.highlighted is a scalar from single-site callbacks
@@ -165,9 +205,8 @@ class ModelGraph(Panel):
                 go.Scatter(
                     x=df_highlighted["resistivity"],
                     y=df_highlighted["depth"],
-
-
-
+                    customdata=df_highlighted[['site_id', 'utm_e', 'utm_n']].values,
+                    hovertemplate=hovertemplate,
                     mode="lines",
                     line=dict(width=2, color='red'),
                     zorder=10,
@@ -856,8 +895,12 @@ class ModelSection(Panel):
             res_grid_above = res_grid
             res_grid_below = None
 
-        id_map = df.groupby(x_axis)[['site_id', 'latitude', 'longitude']].first()
-        site_info = id_map.reindex(pivot.index)[['site_id', 'latitude', 'longitude']].values
+        id_map = df.groupby(x_axis)[['site_id', 'latitude', 'longitude']].first().reindex(pivot.index)
+        # customdata columns: [site_id, lat, lon, utm E, utm N] -- app.py's
+        # sync_hover_to_map relies on the first three staying in this order.
+        utm_e, utm_n = latlon_to_utm(id_map['latitude'].values, id_map['longitude'].values)
+        zone_label = utm_zone_label(id_map['latitude'].values, id_map['longitude'].values)
+        site_info = np.column_stack([id_map[['site_id', 'latitude', 'longitude']].values, utm_e, utm_n])
 
         if self.settings.bars:
 
@@ -912,7 +955,7 @@ class ModelSection(Panel):
 
             custom_data_grid = np.tile(site_info, (len(y), 1, 1))
 
-        # Append each cell's actual (non-log) resistivity as a 4th
+        # Append each cell's actual (non-log) resistivity as a 6th
         # customdata column, aligned with res_grid_final -- lets the main
         # heatmap trace's hovertemplate show a Res value per bar, the same
         # way hovering a borehole box shows its lithology (see
@@ -953,8 +996,10 @@ class ModelSection(Panel):
         fig = go.Figure(data=go.Heatmap(
             z=np.log10(res_grid_final),
             hovertemplate=(
-                f"Site: %{{customdata[0]}}<br>{y_label}: %{{y:.1f}} m<br>"
-                "Resistivity: %{customdata[3]:.1f} Ωm<extra></extra>"
+                f"Site: %{{customdata[0]}}<br>"
+                f"UTM{zone_label}: %{{customdata[3]:.0f}} E, %{{customdata[4]:.0f}} N<br>"
+                f"{y_label}: %{{y:.1f}} m<br>"
+                "Resistivity: %{customdata[5]:.1f} Ωm<extra></extra>"
             ),
             colorbar=dict(
                 orientation="h",

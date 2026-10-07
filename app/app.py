@@ -38,6 +38,7 @@ from datetime import datetime
 import temframe
 
 from model3d_panel import Model3D
+from report_panel import ReportPanel, REPORT_SETTING_STATES, report_settings_from_states
 
 external_stylesheets = [themes.BOOTSTRAP]
 app = Dash(__name__, suppress_callback_exceptions=True, assets_folder='assets',  external_stylesheets=external_stylesheets)
@@ -64,12 +65,14 @@ mod2      = ModelSection( dataframe=sesh.models )
 
 mod3d = Model3D( dataframe=sesh.models ) 
 
+Simple_inv = SimpleInversion( dataframe=sesh.data )
 Multi_inv = MultiInversion( dataframe=sesh.data )
 Sing_inv  = Single_site( dataframe=sesh.data, rho=10 )
 hkr       = HotKeyReminder()
 table_overview = TableOverview( dataframe=sesh.overview )
+report_panel = ReportPanel()
 
-panels = [u1, m1, dbdt1, dbdt2, mod1, mod2, mod3d, Multi_inv, Sing_inv, rhoa, hkr, table_overview]
+panels = [u1, m1, dbdt1, dbdt2, mod1, mod2, mod3d, Simple_inv, Multi_inv, Sing_inv, rhoa, hkr, table_overview, report_panel]
 nodes = [node for panel in panels for node in panel.to_nodes()]
 
 
@@ -99,6 +102,9 @@ app.layout = html.Div([
     dcc.Store(id="selected_sites_local", data=[]),
 
     dcc.Store(id="export-request", data=None),
+    # Last camera (angle/azimuth/zoom) of the 3D Model view -- see
+    # remember_3d_camera. Used by the report and the Interpret export.
+    dcc.Store(id="model-3d-camera", data=None),
 
     dcc.Store(id="borehole-loaded", data=False),
 
@@ -781,15 +787,43 @@ app.clientside_callback(
 
 
 @app.callback(
+    Output('model-3d-camera', 'data'),
+    Input('model_3d', 'relayoutData'),
+    State('model-3d-camera', 'data'),
+    prevent_initial_call=True,
+)
+def remember_3d_camera(relayout_data, camera):
+    # relayoutData only holds the most recent event, and resizing the
+    # graph (e.g. switching tabs) replaces the camera with
+    # {'autosize': True}. Keep the last camera seen instead. Plotly sends
+    # either the whole camera ('scene.camera') or single parts of it
+    # ('scene.camera.eye', ...).
+    if not relayout_data:
+        raise PreventUpdate
+    camera = dict(camera or {})
+    changed = False
+    for key, value in relayout_data.items():
+        if key == 'scene.camera' and isinstance(value, dict):
+            camera.update(value)
+            changed = True
+        elif key.startswith('scene.camera.'):
+            camera[key[len('scene.camera.'):]] = value
+            changed = True
+    if not changed:
+        raise PreventUpdate
+    return camera
+
+
+@app.callback(
     Output('export-toast', 'is_open'),
     Output('export-toast', 'children'),
     Output('export-toast', 'icon'),
     Input('export-request', 'data'),
     State('interpret_layout', 'color'),
-    State('model_3d', 'relayoutData'),
+    State('model-3d-camera', 'data'),
     prevent_initial_call=True,
 )
-def export_interpret_view_callback(export_request, interpret_layout_color, relayout_data):
+def export_interpret_view_callback(export_request, interpret_layout_color, saved_camera):
     # The Enable/Export button is dual-purpose: unified_handler above
     # bails out immediately whenever the Interpret tab is active (color
     # == 'primary'), so this callback -- the mirror-image condition --
@@ -801,9 +835,9 @@ def export_interpret_view_callback(export_request, interpret_layout_color, relay
         return True, "No data loaded to export.", "warning"
 
     export_3d = bool(export_request.get('export_3d'))
-    # Plotly puts the whole updated camera dict under this exact key
-    # whenever the user drags/rotates a 3D scene; absent if they never did.
-    camera = (relayout_data or {}).get('scene.camera') if export_3d else None
+    # Last camera of the 3D view (see remember_3d_camera); None if the
+    # user never rotated it, which means the default view.
+    camera = saved_camera if export_3d else None
 
     try:
         png_path, kmz_path = export_interpret_view(export_3d=export_3d, camera=camera)
@@ -1093,14 +1127,19 @@ def save_session(n1):
     Output('report-toast', 'icon'),
     Output('report-toast', 'header'),
     Input('generateReportButton', 'n_clicks'),
+    Input('report-generate-button', 'n_clicks'),
+    *REPORT_SETTING_STATES,
+    State('model-3d-camera', 'data'),
     running=[
         (Output('generateReportButton', 'disabled'), True, False),
+        (Output('report-generate-button', 'disabled'), True, False),
         (Output('report-progress-modal', 'is_open'), True, False),
         (Output('report-progress-poll', 'disabled'), False, True),
     ],
     prevent_initial_call=True,
 )
-def generate_report_button(n1):
+def generate_report_button(n1, n2, section_order, markersize, zoom_offset, radius, camera):
+    report_settings = report_settings_from_states(section_order, markersize, zoom_offset, radius)
     import report
     # Same "ask for a folder only if one isn't already chosen" flow as
     # save_session, so a report generated before any session save still
@@ -1120,7 +1159,8 @@ def generate_report_button(n1):
 
     save_path = os.path.join(sesh.save_dir, 'QC_report.docx')
     try:
-        report.generate_report(save_path)
+        # Same settings and 3D camera as the Report tab's preview.
+        report.generate_report(save_path, options=report_settings, camera=camera)
     except Exception as e:
         print(f'Report generation failed: {e}')
         return True, f"Report generation failed: {e}", "danger", "Report Failed"
@@ -1442,11 +1482,31 @@ def update_starting_model_from_single_drag(relayout, model):
 
 
 @app.callback(
+    Output("starting-model", "data", allow_duplicate=True),
+    Input("simple_inv", "relayoutData"),
+    State("starting-model", "data"),
+    prevent_initial_call=True
+)
+def update_starting_model_from_simple_drag(relayout, model):
+    # Same as update_starting_model_from_drag, for the default "Inversion" tab.
+    if not relayout:
+        raise PreventUpdate
+
+    moved = [k for k in relayout if k.endswith(".x0")]
+    if not moved:
+        raise PreventUpdate
+
+    model["rho"] = float(relayout[moved[0]])
+    return model
+
+
+@app.callback(
     Output("inv-log-poll", "n_intervals"),
     Input("invert_all_button", "n_clicks"),
+    Input("invert_default_button", "n_clicks"),
     prevent_initial_call=True,
 )
-def reset_polling(n):
+def reset_polling(n, n_default):
     return 0
 
 
@@ -1624,7 +1684,7 @@ def cancel_upload(n_clicks):
 @app.callback(
     Output('output-data-upload', 'children', allow_duplicate=True),
     m1.output, dbdt1.output, dbdt2.output, rhoa.output,
-    Multi_inv.output, Sing_inv.output, table_overview.output,
+    Multi_inv.output, Sing_inv.output, table_overview.output, Simple_inv.output,
     Output('upload-toast', 'is_open', allow_duplicate=True),
     Output('upload-toast', 'children', allow_duplicate=True),
     Output('process_layout', 'disabled', allow_duplicate=True),
@@ -1673,7 +1733,7 @@ def process_upload(action, pending):
         m1.lines = None
         m1.buffer_sites = None
         mod1.buffer_sites = None
-        for panel in (m1, mod1, mod2, mod3d, dbdt1, dbdt2, rhoa, Multi_inv, Sing_inv, table_overview):
+        for panel in (m1, mod1, mod2, mod3d, dbdt1, dbdt2, rhoa, Simple_inv, Multi_inv, Sing_inv, table_overview):
             panel.dataframe = None
         working_dir_out = "No working directory selected."
         use_borehole_value_out = False
@@ -1724,6 +1784,7 @@ def process_upload(action, pending):
     dbdt1.dataframe = buffered_df
     dbdt2.dataframe = full_df          # keep full section view
     rhoa.dataframe  = buffered_df
+    Simple_inv.dataframe = sesh.data.copy()
     Multi_inv.dataframe = sesh.data.copy()
     Sing_inv.dataframe = sesh.data.copy()
 
@@ -1747,7 +1808,7 @@ def process_upload(action, pending):
 
     return (
         html.Div(upload_msg), m1.render(), dbdt1.render(), dbdt2.render(), rhoa.render(),
-        Multi_inv.render(), Sing_inv.render(), table_overview.render(), True, toast_msg, False, False, no_update,
+        Multi_inv.render(), Sing_inv.render(), table_overview.render(), Simple_inv.render(), True, toast_msg, False, False, no_update,
         *bbox_vals, {'display': 'block'}, {'display': 'block'},
         None, False,
         working_dir_out, use_borehole_value_out, use_borehole_label_out,
@@ -2081,6 +2142,7 @@ def handle_url_hash(url_hash, model):
             m1.dataframe    = sesh.overview.copy()
             table_overview.dataframe = sesh.overview.copy()
             rhoa.dataframe  = sesh.data.copy()
+            Simple_inv.dataframe = sesh.data.copy()
             Multi_inv.dataframe = sesh.data.copy()
             Sing_inv.dataframe = sesh.data.copy()
             res[0] = m1.render()
