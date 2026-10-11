@@ -1,6 +1,21 @@
 import sys, os, time
 from tkinter import filedialog, Tk
 
+# The packaged exe has no console window (PyInstaller --noconsole), so
+# print() output and callback tracebacks (Flask logs them to stderr) would
+# vanish. Send both to a log file instead, so problems on a user's machine
+# can be diagnosed afterwards: %LOCALAPPDATA%\SeaAnemone\logs\sea_anemone.log
+# (overwritten on every start).
+if getattr(sys, 'frozen', False):
+    try:
+        _log_dir = os.path.join(os.environ.get('LOCALAPPDATA') or os.path.expanduser('~'), 'SeaAnemone', 'logs')
+        os.makedirs(_log_dir, exist_ok=True)
+        _log_file = open(os.path.join(_log_dir, 'sea_anemone.log'), 'w', encoding='utf-8', buffering=1)
+        sys.stdout = sys.stderr = _log_file
+        print(f'Sea Anemone started {time.strftime("%Y-%m-%d %H:%M:%S")}')
+    except OSError:
+        pass
+
 fpath = os.path.dirname(os.path.abspath(__file__))
 if fpath not in sys.path:
     sys.path.append(fpath)
@@ -679,7 +694,9 @@ def export_interpret_view(export_3d=False, camera=None):
     orientation the user rotated it to, rather than the default view.
 
     Saves into sesh.save_dir (or the working directory if unset). Returns
-    (png_path, kmz_path) -- kmz_path is None when export_3d is True.
+    (png_path, kmz_path, basemap_dropped) -- kmz_path is None when
+    export_3d is True; basemap_dropped is True if the satellite background
+    couldn't be downloaded and the map was exported without it.
     """
     save_dir = sesh.save_dir or os.getcwd()
     os.makedirs(save_dir, exist_ok=True)
@@ -706,7 +723,10 @@ def export_interpret_view(export_3d=False, camera=None):
         map_fig = report._add_map_decorations(m1.render(), m1.settings.view, has_colorbar=has_colorbar)
     finally:
         m1.suppress_line_shape_overlay = orig_suppress_line_shape
-    map_png_bytes = pio.to_image(map_fig, format='png', width=report.REPORT_IMG_WIDTH, height=report.REPORT_IMG_HEIGHT, scale=report.REPORT_IMG_SCALE, engine='kaleido')
+    # figure_to_png retries, and falls back to no satellite background if
+    # the tiles won't download ("Error 525: Map error.") -- see report.py.
+    map_png_bytes, basemap_dropped = report.figure_to_png(
+        map_fig, report.REPORT_IMG_WIDTH, report.REPORT_IMG_HEIGHT, report.REPORT_IMG_SCALE)
 
     if export_3d:
         second_fig = mod3d.render()
@@ -719,7 +739,7 @@ def export_interpret_view(export_3d=False, camera=None):
         # whatever x-axis (line N/site_id/daytime) is currently selected.
         second_fig = mod2.render()
         second_width, second_height = report.PROFILE_IMG_WIDTH, report.PROFILE_IMG_HEIGHT
-    second_png_bytes = pio.to_image(second_fig, format='png', width=second_width, height=second_height, engine='kaleido')
+    second_png_bytes, _ = report.figure_to_png(second_fig, second_width, second_height)
 
     map_img    = Image.open(io.BytesIO(map_png_bytes)).convert('RGB')
     second_img = Image.open(io.BytesIO(second_png_bytes)).convert('RGB')
@@ -731,7 +751,7 @@ def export_interpret_view(export_3d=False, camera=None):
     combined.save(png_path)
 
     if export_3d:
-        return png_path, None
+        return png_path, None, basemap_dropped
 
     kmz_path = os.path.join(save_dir, f"{base_name}.kmz")
     locations = get_shown_site_locations(mod2)
@@ -753,7 +773,7 @@ def export_interpret_view(export_3d=False, camera=None):
     kml.addfile(png_path)
     kml.savekmz(kmz_path)
 
-    return png_path, kmz_path
+    return png_path, kmz_path, basemap_dropped
 
 
 # The FlexLayout `model` prop tracks the whole layout tree (sizes, active
@@ -840,7 +860,7 @@ def export_interpret_view_callback(export_request, interpret_layout_color, saved
     camera = saved_camera if export_3d else None
 
     try:
-        png_path, kmz_path = export_interpret_view(export_3d=export_3d, camera=camera)
+        png_path, kmz_path, basemap_dropped = export_interpret_view(export_3d=export_3d, camera=camera)
     except Exception as e:
         print(f"Export failed: {e}")
         return True, f"Export failed: {e}", "danger"
@@ -849,8 +869,12 @@ def export_interpret_view_callback(export_request, interpret_layout_color, saved
     if kmz_path:
         children.append(html.Div(f"Saved {os.path.basename(kmz_path)}"))
     children.append(html.Div(f"in {os.path.dirname(png_path)}", style={"fontSize": "0.85rem", "color": "#6c757d"}))
+    if basemap_dropped:
+        children.append(html.Div("The satellite background couldn't be downloaded, so the map was "
+                                 "exported without it. Check the internet connection and export again.",
+                                 style={"fontSize": "0.85rem", "marginTop": "4px"}))
 
-    return True, html.Div(children), "success"
+    return True, html.Div(children), ("warning" if basemap_dropped else "success")
 
 
 def refresh_dbdt2_for_line_mode():
@@ -1160,12 +1184,16 @@ def generate_report_button(n1, n2, section_order, markersize, zoom_offset, radiu
     save_path = os.path.join(sesh.save_dir, 'QC_report.docx')
     try:
         # Same settings and 3D camera as the Report tab's preview.
-        report.generate_report(save_path, options=report_settings, camera=camera)
+        basemaps_dropped = report.generate_report(save_path, options=report_settings, camera=camera)
     except Exception as e:
         print(f'Report generation failed: {e}')
         return True, f"Report generation failed: {e}", "danger", "Report Failed"
 
     print(f'Report saved to {save_path}')
+    if basemaps_dropped:
+        return (True, f"Report saved to {save_path}. {basemaps_dropped} map(s) are without the satellite "
+                      "background because it couldn't be downloaded; check the internet connection and "
+                      "generate again.", "warning", "Report Generated")
     return True, f"Report saved to {save_path}", "success", "Report Generated"
 
 
@@ -2317,8 +2345,15 @@ if __name__ == "__main__":
     else:
         chosen_port = int(os.environ.get('SEA_ANEMONE_PORT', 8050))
 
+    # Debug mode (Dash's dev-tools button and in-browser error pop-ups) is
+    # for development only: on when running app.py from source, off in the
+    # packaged exe (PyInstaller sets sys.frozen). Set SEA_ANEMONE_DEBUG=1
+    # before starting the exe to turn it back on for troubleshooting.
+    is_packaged = getattr(sys, 'frozen', False)
+    debug_mode = (not is_packaged) or os.environ.get('SEA_ANEMONE_DEBUG') == '1'
+
     try:
-        app.run(port=chosen_port, debug=True, use_reloader=False)
+        app.run(port=chosen_port, debug=debug_mode, use_reloader=False)
     except Exception as e:
         print(f"Error running app: {e}")
     finally:

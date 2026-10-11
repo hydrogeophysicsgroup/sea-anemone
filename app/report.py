@@ -22,12 +22,14 @@ paying that once for the whole report instead of once per figure (a
 report can easily have 30-40 map figures, each also loading live
 satellite tiles) was close to a 5x speedup in local testing.
 """
+import asyncio
 import io
 import math
 import os
 import shutil
 import tempfile
 import numpy as np
+import plotly.graph_objects as go
 import plotly.io as pio
 from docx import Document
 from docx.shared import Inches, Pt
@@ -169,28 +171,85 @@ def _queue_figure(doc, pending, fig, caption, width_in=6.0, width_px=REPORT_IMG_
     pending.append(dict(fig=fig, paragraph=placeholder, width_px=width_px, height_px=height_px, scale=scale, width_in=width_in))
 
 
+def _has_basemap(fig):
+    """True for a map figure with raster background layers (the satellite tiles)."""
+    try:
+        return bool(fig.layout.map.layers)
+    except AttributeError:
+        return False
+
+
+# Errors a kaleido render can end with. When one figure in a batch fails,
+# kaleido cancels the rest and the call ends with asyncio.CancelledError,
+# which is NOT a subclass of Exception (it derives from BaseException), so
+# a plain `except Exception` lets it crash the whole report.
+RENDER_ERRORS = (Exception, asyncio.CancelledError)
+
+
+def figure_to_png(fig, width, height, scale=1, retries=2):
+    """
+    PNG bytes for one figure, robust to basemap download failures.
+
+    Map figures fetch their satellite background tiles over the internet
+    while kaleido renders them; a single tile that fails or times out makes
+    plotly.js abort the whole image ("Error 525: Map error."). So try a
+    few times, and if it still fails, render without the satellite
+    background rather than not at all.
+
+    Returns (png_bytes, basemap_dropped).
+    """
+    last_error = None
+    for _ in range(retries + 1):
+        try:
+            return pio.to_image(fig, format='png', width=width, height=height, scale=scale), False
+        except RENDER_ERRORS as e:
+            last_error = e
+            print(f'[export] image render failed, retrying: {e}')
+    if _has_basemap(fig):
+        no_basemap = go.Figure(fig)
+        # Direct assignment: update_layout(map_layers=[]) leaves existing layers in place.
+        no_basemap.layout.map.layers = []
+        print('[export] rendering without the satellite background')
+        return pio.to_image(no_basemap, format='png', width=width, height=height, scale=scale), True
+    raise last_error
+
+
 def _flush_pending_images(pending):
     """
     Batch-export every queued figure in chunks of FLUSH_CHUNK_SIZE (see
     module docstring for why batching at all; chunking trades a little of
     that speedup for a REPORT_PROGRESS update after each chunk), then
     insert each into its placeholder paragraph.
+
+    If a batch fails (usually one map whose satellite tiles didn't
+    download), that chunk is rendered figure by figure via figure_to_png,
+    so one bad tile doesn't sink the whole report. Returns the number of
+    maps that had to be rendered without their satellite background.
     """
     if not pending:
-        return
+        return 0
     tmpdir = tempfile.mkdtemp(prefix='sea_anemone_report_')
+    basemaps_dropped = 0
     try:
         total = len(pending)
         REPORT_PROGRESS['total'] = total
         for start in range(0, total, FLUSH_CHUNK_SIZE):
             chunk = pending[start:start + FLUSH_CHUNK_SIZE]
             files = [os.path.join(tmpdir, f"fig_{start + i}.png") for i in range(len(chunk))]
-            pio.write_images(
-                [p['fig'] for p in chunk], files, format='png',
-                width=[p['width_px'] for p in chunk],
-                height=[p['height_px'] for p in chunk],
-                scale=[p['scale'] for p in chunk],
-            )
+            try:
+                pio.write_images(
+                    [p['fig'] for p in chunk], files, format='png',
+                    width=[p['width_px'] for p in chunk],
+                    height=[p['height_px'] for p in chunk],
+                    scale=[p['scale'] for p in chunk],
+                )
+            except RENDER_ERRORS as e:
+                print(f'[report] batch render failed ({e!r}); rendering this chunk one figure at a time')
+                for p, path in zip(chunk, files):
+                    png, dropped = figure_to_png(p['fig'], p['width_px'], p['height_px'], p['scale'])
+                    basemaps_dropped += dropped
+                    with open(path, 'wb') as f:
+                        f.write(png)
             for p, path in zip(chunk, files):
                 run = p['paragraph'].add_run()
                 run.add_picture(path, width=Inches(p['width_in']))
@@ -198,6 +257,7 @@ def _flush_pending_images(pending):
             REPORT_PROGRESS['label'] = f"Rendering figure {REPORT_PROGRESS['current']}/{total}..."
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+    return basemaps_dropped
 
 
 # MapLibre GL (which go.Scattermap/Choroplethmap render through, like
@@ -799,6 +859,9 @@ def generate_report(save_path, options=None, camera=None):
     build_report_items(options, camera). Every figure is queued (see
     _queue_figure) and only actually rendered to PNG once, in batched
     calls, right before the document is saved (see _flush_pending_images).
+
+    Returns the number of maps whose satellite background couldn't be
+    downloaded and were rendered without it (0 normally).
     """
     REPORT_PROGRESS.update(current=0, total=0, label='Preparing figures...', done=False, error=None)
     try:
@@ -816,10 +879,11 @@ def generate_report(save_path, options=None, camera=None):
                               width_px=item['width_px'], height_px=item['height_px'])
 
         print(f"[report] Rendering {len(pending)} figure(s)...")
-        _flush_pending_images(pending)
+        basemaps_dropped = _flush_pending_images(pending)
 
         doc.save(save_path)
         REPORT_PROGRESS['label'] = 'Done'
+        return basemaps_dropped
     except Exception as e:
         REPORT_PROGRESS['error'] = str(e)
         raise
