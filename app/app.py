@@ -757,23 +757,101 @@ def export_interpret_view(export_3d=False, camera=None):
     locations = get_shown_site_locations(mod2)
 
     kml = simplekml.Kml()
+    # addfile() stores the PNG inside the KMZ as files/<name>.png and
+    # returns that path -- the balloon must reference it exactly, or
+    # Google Earth shows an empty picture (it used the bare file name).
+    png_in_kmz = kml.addfile(png_path)
+    balloon = f'<![CDATA[<img src="{png_in_kmz}" width="1000" />]]>'
     if len(locations) >= 2:
         ls = kml.newlinestring(name="Interpret view")
         ls.coords = list(zip(locations['longitude'], locations['latitude']))
         ls.style.linestyle.width = 4
         ls.style.linestyle.color = simplekml.Color.red
-        ls.description = f'<![CDATA[<img src="{os.path.basename(png_path)}" width="1000" />]]>'
+        ls.description = balloon
     elif len(locations) == 1:
         pnt = kml.newpoint(
             name="Interpret view",
             coords=[(locations['longitude'].iloc[0], locations['latitude'].iloc[0])],
         )
-        pnt.description = f'<![CDATA[<img src="{os.path.basename(png_path)}" width="1000" />]]>'
+        pnt.description = balloon
 
-    kml.addfile(png_path)
     kml.savekmz(kmz_path)
 
     return png_path, kmz_path, basemap_dropped
+
+
+def session_name():
+    """The session's folder name (e.g. LM_202610_Chad_Arkoum), or 'session' if it hasn't been saved yet."""
+    if not sesh.save_dir:
+        return 'session'
+    name = os.path.basename(os.path.normpath(sesh.save_dir))
+    return ''.join(ch if ch.isalnum() or ch in '-_.' else '_' for ch in name) or 'session'
+
+
+def export_site_shapefiles(save_dir, name):
+    """
+    One point shapefile per map "Color by" mode, for QGIS, in WGS84
+    (EPSG:4326), each with the sites and that mode's attribute:
+      <name>_FromImport.shp       site attributes only
+      <name>_EnabledDisabled.shp  + status ('Enabled'/'Disabled') and gates
+                                  (number of data points in use)
+      <name>_Misfit.shp           + misfit   (needs an inversion)
+      <name>_DOI.shp              + doi      (needs an inversion)
+    Every file also has site_id, date, daytime, latitude, longitude,
+    elev, utm_x, utm_y and instrument. Existing files with the same name
+    are overwritten. Field names are short because shapefile (dBase)
+    fields are limited to 10 characters.
+
+    Returns (written, skipped): a list of .shp paths, and the names of
+    the files skipped because their attribute doesn't exist yet.
+    """
+    import geopandas as gpd
+
+    site = sesh.site
+    if site is None or site.empty:
+        return [], []
+    site = site[site['site_id'] != -1].dropna(subset=['latitude', 'longitude']).copy()
+    base_cols = [c for c in ('site_id', 'date', 'daytime', 'latitude', 'longitude', 'elevation',
+                             'utm_x', 'utm_y', 'instrument') if c in site.columns]
+
+    # Enabled/disabled from the data's own in-use flags, with the same rule
+    # as the map (a site is disabled when none of its data points is in
+    # use) -- sesh.site's gates_used column only exists after an inversion.
+    data = sesh.data[sesh.data['site_id'] != -1]
+    # Manual flag wins where set, else the automatic one (same as the
+    # Disable/Enable buttons' 'include' column).
+    in_use = data['inuse_manual'].fillna(data['inuse_auto']).astype(bool)
+    gates = in_use.groupby(data['site_id']).sum()
+    site['gates'] = site['site_id'].map(gates).fillna(0).astype(int)
+    site['status'] = np.where(site['gates'] > 0, 'Enabled', 'Disabled')
+
+    layers = [
+        ('FromImport', []),
+        ('EnabledDisabled', ['status', 'gates']),
+        ('Misfit', ['misfit']),
+        ('DOI', ['doi']),
+    ]
+    written, skipped = [], []
+    for suffix, extra in layers:
+        if any(c not in site.columns for c in extra):
+            skipped.append(suffix)
+            continue
+        table = site[base_cols + extra].rename(columns={'elevation': 'elev', 'instrument': 'instrumen'})
+        gdf = gpd.GeoDataFrame(table, geometry=gpd.points_from_xy(table['longitude'], table['latitude']), crs='EPSG:4326')
+        path = os.path.join(save_dir, f"{name}_{suffix}.shp")
+        # Windows' 260-character path limit: GDAL can write such a file but
+        # then can't reopen or replace it ("... .shp is not a directory").
+        if len(os.path.abspath(path)) > 255:
+            raise ValueError(f"the folder path is too long for Windows ({len(os.path.abspath(path))} characters "
+                             "incl. file name, max ~255). Save the session in a shorter folder path and export again.")
+        # Remove the previous export's files first, so re-exporting replaces them.
+        stem = os.path.splitext(path)[0]
+        for ext in ('.shp', '.shx', '.dbf', '.prj', '.cpg'):
+            if os.path.exists(stem + ext):
+                os.remove(stem + ext)
+        gdf.to_file(path, driver='ESRI Shapefile', engine='pyogrio')
+        written.append(path)
+    return written, skipped
 
 
 # The FlexLayout `model` prop tracks the whole layout tree (sizes, active
@@ -875,6 +953,36 @@ def export_interpret_view_callback(export_request, interpret_layout_color, saved
                                  style={"fontSize": "0.85rem", "marginTop": "4px"}))
 
     return True, html.Div(children), ("warning" if basemap_dropped else "success")
+
+
+@app.callback(
+    Output('export-toast', 'is_open', allow_duplicate=True),
+    Output('export-toast', 'children', allow_duplicate=True),
+    Output('export-toast', 'icon', allow_duplicate=True),
+    Input('exportShpButton', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def export_shapefile_callback(n_clicks):
+    # "🗺️ Export to .shp" on the Interpret tab (see panels.py).
+    if not n_clicks:
+        raise PreventUpdate
+    if sesh.data is None:
+        return True, "No data loaded to export.", "warning"
+    save_dir = sesh.save_dir or os.getcwd()
+    os.makedirs(save_dir, exist_ok=True)
+    try:
+        written, skipped = export_site_shapefiles(save_dir, session_name())
+    except Exception as e:
+        print(f"Shapefile export failed: {e}")
+        return True, f"Shapefile export failed: {e}", "danger"
+    if not written:
+        return True, "No sites to export.", "warning"
+    children = [html.Div(f"Saved {os.path.basename(p)}") for p in written]
+    if skipped:
+        children.append(html.Div(f"Skipped {', '.join(skipped)}: run an inversion first.",
+                                 style={"fontSize": "0.85rem", "marginTop": "4px"}))
+    children.append(html.Div(f"in {save_dir}", style={"fontSize": "0.85rem", "color": "#6c757d"}))
+    return True, html.Div(children), "success"
 
 
 def refresh_dbdt2_for_line_mode():
@@ -2252,12 +2360,16 @@ def sync_hover_to_map(hoverData, current_fig):
         print(f"Hover Unpack Error: {e}")
         return no_update
 
-    # Update the Map Figure
+    return _map_with_hover_marker(current_fig, lat, lon)
+
+
+def _map_with_hover_marker(current_fig, lat, lon):
+    """The current map figure with a white/red target marker at lat/lon, replacing any previous one."""
     fig = go.Figure(current_fig)
-    
+
     # 1. Clear previous highlights
     fig.data = [t for t in fig.data if t.name != 'hover-highlight']
-    
+
     # 2. Add the new pinpoint
     fig.add_trace(go.Scattermap(
         lat=[lat],
@@ -2267,7 +2379,7 @@ def sync_hover_to_map(hoverData, current_fig):
         name='hover-highlight',
         showlegend=False
     ))
-    
+
     # Add a second smaller dot inside for a 'target' look
     fig.add_trace(go.Scattermap(
         lat=[lat], lon=[lon],
@@ -2278,6 +2390,31 @@ def sync_hover_to_map(hoverData, current_fig):
     ))
 
     return fig
+
+
+@app.callback(
+    Output(m1.id, 'figure', allow_duplicate=True),
+    Input(mod3d.id, 'hoverData'),
+    State(m1.id, 'figure'),
+    prevent_initial_call=True
+)
+def sync_3d_hover_to_map(hoverData, current_fig):
+    # Same marker as sync_hover_to_map, for the 3D view. 3D hover events
+    # carry the hovered point's scene x/y, which are UTM easting/northing
+    # here (see Model3D.render), so mark the nearest site.
+    if not hoverData or not current_fig or mod3d.dataframe is None or mod3d.dataframe.empty:
+        return no_update
+    point = hoverData['points'][0]
+    x, y = point.get('x'), point.get('y')
+    if x is None or y is None:
+        return no_update
+    sites = mod3d.dataframe.drop_duplicates('site_id').dropna(subset=['latitude', 'longitude'])
+    if sites.empty:
+        return no_update
+    utm_x, utm_y = mod3d._project_latlon(sites['latitude'].values, sites['longitude'].values)
+    nearest = np.nanargmin((utm_x - float(x)) ** 2 + (utm_y - float(y)) ** 2)
+    site = sites.iloc[nearest]
+    return _map_with_hover_marker(current_fig, float(site['latitude']), float(site['longitude']))
 
 
 # import signal

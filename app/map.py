@@ -743,13 +743,24 @@ class Map(Panel):
             buffer_idx = layer_order.index('buffer')
             layer_order[buffer_idx:buffer_idx + 1] = buffer_layer_names
 
-        fig.update_layout(map_style="white-bg",
-            map_layers=[
-                {
-                    "below": 'traces',
-                    "sourcetype": "raster",
-                    "source": ['https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}']
-                }])
+        # Satellite background only while the tile server is reachable:
+        # offline, MapLibre keeps retrying tiles that can never load on
+        # every pan/zoom/redraw, which made the map (and line drawing)
+        # lag badly. See basemap_online() below.
+        if basemap_online():
+            fig.update_layout(map_style="white-bg",
+                map_layers=[
+                    {
+                        "below": 'traces',
+                        "sourcetype": "raster",
+                        "source": BASEMAP_TILE_URLS
+                    }])
+        else:
+            fig.update_layout(map_style="white-bg", map_layers=[])
+            fig.add_annotation(
+                text="Offline: satellite background hidden", xref='paper', yref='paper',
+                x=0.01, y=0.01, xanchor='left', yanchor='bottom', showarrow=False,
+                font=dict(size=11, color='#555'), bgcolor='rgba(255,255,255,0.8)')
 
         # self.highlighted holds site_id values (set throughout
         # unified_handler from df_data["site_id"]), not row positions --
@@ -1458,6 +1469,42 @@ class Map(Panel):
                     result = x_axis
             return result
         
+
+# Same satellite tiles from four equivalent Google servers -- MapLibre
+# spreads tile requests across all URLs in a raster source, so a report
+# rendering dozens of maps doesn't hammer one server (bursts of requests
+# to a single host got throttled, failing a tile and with it the whole
+# image: kaleido "Error 525: Map error.").
+BASEMAP_TILE_URLS = [f'https://mt{i}.google.com/vt/lyrs=s&x={{x}}&y={{y}}&z={{z}}' for i in range(4)]
+_BASEMAP_HOST = ('mt1.google.com', 443)
+_basemap_state = {'online': True, 'thread': None}
+
+
+def _watch_basemap_connection(interval=20.0):
+    """Background loop: is the satellite tile server reachable? (see basemap_online)"""
+    import socket
+    while True:
+        try:
+            with socket.create_connection(_BASEMAP_HOST, timeout=2.0):
+                _basemap_state['online'] = True
+        except OSError:
+            _basemap_state['online'] = False
+        time.sleep(interval)
+
+
+def basemap_online():
+    """
+    Whether the satellite tile server was reachable at the last check.
+    A daemon thread re-checks every 20 s, so Map.render() never waits on
+    the network; the first call starts it and assumes online until the
+    first check finishes.
+    """
+    if _basemap_state['thread'] is None:
+        import threading
+        _basemap_state['thread'] = threading.Thread(target=_watch_basemap_connection, daemon=True)
+        _basemap_state['thread'].start()
+    return _basemap_state['online']
+
 
 MEAN_RES_DEPTHS = list(range(0, 301, 10))
 

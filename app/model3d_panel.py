@@ -15,28 +15,31 @@ from model import RESISTIVITY_COLORSCALE, resistivity_colorbar_tick_kwargs, utm_
 
 @nosj
 class Model3DSettings(PanelSettings):
-    z: Literal['depth', 'elevation'] = 'elevation'
-    vmin: float = 1.0
-    vmax: float = 500.0
+    # Titles are what the gear-settings form shows (the raw names were
+    # unclear -- e.g. line_width only ever sized borehole lines, while the
+    # resistivity columns are sized by box_half_width).
+    z: Literal['depth', 'elevation'] = field(default='elevation', metadata={'title': 'Vertical axis'})
+    vmin: float = field(default=1.0, metadata={'title': 'Colour scale min (Ωm)'})
+    vmax: float = field(default=500.0, metadata={'title': 'Colour scale max (Ωm)'})
     # Same meaning as ModelSection's Log Colorbar toggle (see model.py) --
     # off (default) labels the colorbar with real Ωm values at their
     # correct log-spaced positions, on shows the raw log10 exponent.
     log_colorbar: bool = field(default=False, metadata={'title': 'Log Colorbar'})
-    line_width: float = 8.0
-    box_half_width: float = 4.0
-    vertical_exaggeration: float = 1.0
+    line_width: float = field(default=8.0, metadata={'title': 'Borehole line width'})
+    box_half_width: float = field(default=4.0, metadata={'title': 'Model column half-width (m)'})
+    vertical_exaggeration: float = field(default=1.0, metadata={'title': 'Vertical exaggeration'})
     # On by default: layers below the DOI are hidden rather than drawn as a
     # faded second trace. Untick to bring them back at below_doi_opacity.
-    mask_below_doi: bool = True
-    below_doi_opacity: float = 0.15
-    show_boreholes: bool = True
-    show_legend: bool = False
-    show_site_markers: bool = False
-    show_map_layer: bool = False
-    map_layer_zoom: int = 15
-    map_layer_resolution: int = 400
-    map_layer_z_offset: float = 0.0
-    show_mean_res_layer: bool = False
+    mask_below_doi: bool = field(default=True, metadata={'title': 'Hide layers below DOI'})
+    below_doi_opacity: float = field(default=0.15, metadata={'title': 'Below-DOI opacity (0-1)'})
+    show_boreholes: bool = field(default=True, metadata={'title': 'Show boreholes'})
+    show_legend: bool = field(default=False, metadata={'title': 'Show legend'})
+    show_site_markers: bool = field(default=False, metadata={'title': 'Show site markers'})
+    show_map_layer: bool = field(default=False, metadata={'title': 'Show satellite map'})
+    map_layer_zoom: int = field(default=15, metadata={'title': 'Satellite map detail (zoom)'})
+    map_layer_resolution: int = field(default=400, metadata={'title': 'Satellite map resolution (px)'})
+    map_layer_z_offset: float = field(default=0.0, metadata={'title': 'Satellite map height offset (m)'})
+    show_mean_res_layer: bool = field(default=False, metadata={'title': 'Show mean res layer'})
     # Same fixed 10m-band depth choices as the 2D map's mean-res dropdown
     # (map.py's Map._mean_res_z_new/dbc.Select) -- kept in exact sync so a
     # depth picked here means the same thing there. Literal requires each
@@ -45,7 +48,7 @@ class Model3DSettings(PanelSettings):
         0, -10, -20, -30, -40, -50, -60, -70, -80, -90, -100,
         -110, -120, -130, -140, -150, -160, -170, -180, -190, -200,
         -210, -220, -230, -240, -250, -260, -270, -280, -290, -300,
-    ] = 0
+    ] = field(default=0, metadata={'title': 'Mean res layer depth (m)'})
 
 
 class Model3D(Panel):

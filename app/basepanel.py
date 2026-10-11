@@ -256,14 +256,25 @@ class PanelSettings:
                     n_render += 1
             if n_render == n_special_renders:
                 input_type = 'text'
+                step = None
                 if prop.get('type') == 'number':
                     input_type = 'number'
+                    # 'any': without it the browser's default step of 1
+                    # marks decimals like 0.5 invalid and sends None.
+                    step = 'any'
+                elif prop.get('type') == 'integer':
+                    input_type = 'number'
+                    step = 1
                 row_children.append(
                     dbc.Input(
                         type=input_type,
+                        step=step,
                         id={'type': f'settings-{self.id}', 'key': key},
                         value=eval(f'self.{key}'),
-                        debounce=True,
+                        # Send 0.6 s after the last change. debounce=True
+                        # only sent on Enter/blur, so the up/down arrows
+                        # changed the number on screen but never applied it.
+                        debounce=600,
                         style={'margin': '5px'}
                     )
                 )

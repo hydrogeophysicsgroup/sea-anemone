@@ -690,7 +690,80 @@ class ModelSection(Panel):
         half_widths = local_gap * self._LOCAL_SQUEEZE_FACTOR
         if target_half_width is not None:
             half_widths = np.minimum(half_widths, target_half_width)
-        return half_widths
+        # Never thinner than _MIN_BAR_FRACTION of the normal width, even
+        # for sites packed closer than that -- those bars then overlap,
+        # which _bar_layers handles by drawing them in a layer on top.
+        min_half_width = (target_half_width if target_half_width is not None else fallback) * self._MIN_BAR_FRACTION
+        return np.maximum(half_widths, min_half_width)
+
+    # Smallest bar width, as a fraction of the normal (section-length
+    # based) width. Below this a bar becomes a hard-to-see sliver, so
+    # tightly packed sites are allowed to overlap instead.
+    _MIN_BAR_FRACTION = 0.4
+
+    @staticmethod
+    def _bar_layers(x, half_widths, res_above, res_below, site_info):
+        """
+        Split the section's bars into heatmap "layers" with exact edges.
+
+        Each bar i spans exactly [x_i - w_i, x_i + w_i]. A heatmap given
+        len(columns) + 1 x values treats them as column EDGES, so each
+        layer is laid out as alternating bar / gap columns with real edge
+        positions -- no tiny offset columns. (The old layout put a NaN
+        column 0.0001 x-units outside each bar edge; on the daytime axis
+        (milliseconds since 1970, ~1.7e12) that offset is below floating
+        point precision, and wherever two bars touched the offsets crossed
+        over, giving out-of-order x values that Plotly draws as half or
+        missing bars.)
+
+        Bars that would overlap a neighbour (only possible because of the
+        minimum width, see _local_half_widths) go into a later layer,
+        which is drawn on top. Returns a list of
+        (edges, res_above, res_below_or_None, site_info) per layer, where
+        the arrays have one column per bar/gap column (NaN for gaps).
+        """
+        left, right = x - half_widths, x + half_widths
+        span = float(np.nanmax(right) - np.nanmin(left)) if len(x) else 0.0
+        tol = 1e-9 * max(span, 1.0)
+
+        # Greedy interval layering: each bar goes into the first layer
+        # whose last bar ends at or before this bar's left edge.
+        layer_members, layer_end = [], []
+        for i in np.argsort(left, kind='stable'):
+            for k, end in enumerate(layer_end):
+                if left[i] >= end - tol:
+                    layer_members[k].append(i)
+                    layer_end[k] = right[i]
+                    break
+            else:
+                layer_members.append([i])
+                layer_end.append(right[i])
+
+        nan_info = np.full(site_info.shape[1], np.nan)
+        layers = []
+        for members in layer_members:
+            edges = [left[members[0]]]
+            cols = []
+            for i in members:
+                if left[i] > edges[-1] + tol:
+                    cols.append(-1)           # gap column up to this bar
+                    edges.append(left[i])
+                cols.append(i)
+                edges.append(right[i])
+            cols = np.array(cols)
+            is_gap = cols < 0
+            safe = np.where(is_gap, 0, cols)
+
+            def pick(grid):
+                out = grid[:, safe].astype(float)
+                out[:, is_gap] = np.nan
+                return out
+
+            info = site_info[safe].astype(float)
+            info[is_gap] = nan_info
+            layers.append((np.array(edges, dtype=float), pick(res_above),
+                           pick(res_below) if res_below is not None else None, info))
+        return layers
 
     def _empty_line_figure(self, x_axis):
         """Axes-only shell for 'line N' mode when there are no TEM models
@@ -903,65 +976,15 @@ class ModelSection(Panel):
         site_info = np.column_stack([id_map[['site_id', 'latitude', 'longitude']].values, utm_e, utm_n])
 
         if self.settings.bars:
-
-            n_sites = len(x)
-            n_depths = res_grid.shape[0]
-
             # Per-point half-width (see _local_half_widths) rather than
             # the single `width` scalar for every bar -- `width` (from
             # _bar_width, the view's overall median spacing) is still
             # used as the single-point fallback and for boreholes/the
             # highlight rect below, where a per-site value doesn't apply.
             half_widths = self._local_half_widths(x, fallback=width, total_length=total_length)
-
-            # Use 4 points per site: [Left_Gap, Left_Edge, Right_Edge, Right_Gap]
-            x_plot = np.zeros(n_sites * 4)
-
-            for i in range(n_sites):
-                idx = 4 * i
-                center_x = x[i]
-                w = half_widths[i]
-
-                # 1. Coordinate slightly left of the bar (NaN)
-                x_plot[idx]     = center_x - w - 0.0001
-                # 2. Left edge of bar
-                x_plot[idx + 1] = center_x - w
-                # 3. Right edge of bar
-                x_plot[idx + 2] = center_x + w
-                # 4. Coordinate slightly right of the bar (NaN)
-                x_plot[idx + 3] = center_x + w + 0.0001
-
-            def _expand_bars(grid):
-                # Assign values only to the bar edges (idx+1 and idx+2) --
-                # this creates a solid block of color between them.
-                grid_new = np.full((n_depths, n_sites * 4), np.nan)
-                for i in range(n_sites):
-                    idx = 4 * i
-                    grid_new[:, idx + 1] = grid[:, i]
-                    grid_new[:, idx + 2] = grid[:, i]
-                return grid_new
-
-            x_final = x_plot
-            res_grid_final = _expand_bars(res_grid_above)
-            res_grid_below_final = _expand_bars(res_grid_below) if res_grid_below is not None else None
-
-            # for the hovermarker
-            site_info_expanded = np.repeat(site_info, 4, axis=0)
-            custom_data_grid = np.tile(site_info_expanded, (len(y), 1, 1))
+            layers = self._bar_layers(x, half_widths, res_grid_above, res_grid_below, site_info)
         else:
-            x_final = x
-            res_grid_final = res_grid_above
-            res_grid_below_final = res_grid_below
-
-            custom_data_grid = np.tile(site_info, (len(y), 1, 1))
-
-        # Append each cell's actual (non-log) resistivity as a 6th
-        # customdata column, aligned with res_grid_final -- lets the main
-        # heatmap trace's hovertemplate show a Res value per bar, the same
-        # way hovering a borehole box shows its lithology (see
-        # add_boreholes_to_section_fig above).
-        custom_data_grid = np.concatenate(
-            [custom_data_grid, res_grid_final[:, :, None]], axis=-1)
+            layers = [(x, res_grid_above, res_grid_below, site_info)]
 
         # Final Plotting using Graph Objects for precision
         import plotly.graph_objects as go
@@ -981,50 +1004,63 @@ class ModelSection(Panel):
             **resistivity_colorbar_tick_kwargs(self.settings.vmin, self.settings.vmax, self.settings.log_colorbar),
         )
 
-        heatmap_kwargs = dict(
-            x=x_final,
-            y=y,
-            customdata=custom_data_grid,
-            zsmooth=False,
-            hoverongaps=False,
-            colorscale=RESISTIVITY_COLORSCALE,
-            zmin=zmin,
-            zmax=zmax,
-        )
-
         y_label = 'Elevation' if y_axis == 'elevation' else 'Depth'
-        fig = go.Figure(data=go.Heatmap(
-            z=np.log10(res_grid_final),
-            hovertemplate=(
-                f"Site: %{{customdata[0]}}<br>"
-                f"UTM{zone_label}: %{{customdata[3]:.0f}} E, %{{customdata[4]:.0f}} N<br>"
-                f"{y_label}: %{{y:.1f}} m<br>"
-                "Resistivity: %{customdata[5]:.1f} Ωm<extra></extra>"
-            ),
-            colorbar=dict(
-                orientation="h",
-                # In paper-fraction units (a % of the whole figure's
-                # height), not axis-relative -- keep in sync with the
-                # dummy colorbar below and both margin=dict(b=...) calls
-                # in this file, which all assume the same gap.
-                y=-0.45,
-                x=0.5,
-                xanchor="center",
-                len=0.5,
-                thickness=15,
-                **colorbar_kwargs),
-            **heatmap_kwargs
-        ))
+        hovertemplate = (
+            f"Site: %{{customdata[0]}}<br>"
+            f"UTM{zone_label}: %{{customdata[3]:.0f}} E, %{{customdata[4]:.0f}} N<br>"
+            f"{y_label}: %{{y:.1f}} m<br>"
+            "Resistivity: %{customdata[5]:.1f} Ωm<extra></extra>"
+        )
+        colorbar = dict(
+            orientation="h",
+            # In paper-fraction units (a % of the whole figure's
+            # height), not axis-relative -- keep in sync with the
+            # dummy colorbar below and both margin=dict(b=...) calls
+            # in this file, which all assume the same gap.
+            y=-0.45,
+            x=0.5,
+            xanchor="center",
+            len=0.5,
+            thickness=15,
+            **colorbar_kwargs)
 
-        if res_grid_below_final is not None:
+        # One heatmap (plus its faded below-DOI twin) per layer -- normally
+        # a single layer; extra layers only hold bars that would otherwise
+        # overlap a neighbour (see _bar_layers) and are drawn on top. The
+        # first layer's main trace stays fig.data[0] and carries the colorbar.
+        fig = go.Figure()
+        for k, (layer_x, layer_above, layer_below, layer_info) in enumerate(layers):
+            # customdata columns: [site_id, lat, lon, utm E, utm N, resistivity]
+            # -- the resistivity column lets the hovertemplate show the
+            # actual (non-log) value per cell.
+            customdata = np.concatenate(
+                [np.tile(layer_info, (len(y), 1, 1)), layer_above[:, :, None]], axis=-1)
+            heatmap_kwargs = dict(
+                x=layer_x,
+                y=y,
+                customdata=customdata,
+                zsmooth=False,
+                hoverongaps=False,
+                colorscale=RESISTIVITY_COLORSCALE,
+                zmin=zmin,
+                zmax=zmax,
+            )
             fig.add_trace(go.Heatmap(
-                z=np.log10(res_grid_below_final),
-                opacity=0.35,
-                showscale=False,
-                hoverinfo='skip',
-                name='Below DOI',
+                z=np.log10(layer_above),
+                hovertemplate=hovertemplate,
+                showscale=(k == 0),
+                colorbar=colorbar,
                 **heatmap_kwargs
             ))
+            if layer_below is not None:
+                fig.add_trace(go.Heatmap(
+                    z=np.log10(layer_below),
+                    opacity=0.35,
+                    showscale=False,
+                    hoverinfo='skip',
+                    name='Below DOI',
+                    **heatmap_kwargs
+                ))
 
         # Heatmap traces don't support Plotly's box/lasso select at all --
         # only scatter-like traces with discrete markers do -- so a drawn
@@ -1053,7 +1089,8 @@ class ModelSection(Panel):
             fig.update_yaxes(autorange="reversed")
 
         # Filter out NaNs to find the real min/max for the range
-        valid_x = x_final[~np.isnan(x_final)]
+        all_x = np.concatenate([np.asarray(layer[0], dtype=float) for layer in layers])
+        valid_x = all_x[~np.isnan(all_x)]
         x_min, x_max = np.min(valid_x), np.max(valid_x)
 
         # 3. Update Layout

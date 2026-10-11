@@ -1380,6 +1380,11 @@ class HotKeyReminder(Panel):
                     dbc.Button("Disable [ctrl+d]", id='disableButton'),
                     html.Div(style={'width':'6px'}, id='disable-enable-spacer'),
                     dbc.Button("Enable  [ctrl+e]", id='enableButton'),
+                    # Interpret tab only (see interpret_mode_ui): site
+                    # points as a shapefile for QGIS -- app.py's
+                    # export_shapefile_callback.
+                    html.Div(style={'display': 'none'}, id='export-shp-spacer'),
+                    dbc.Button("🗺️ Export to .shp", id='exportShpButton', style={'display': 'none'}),
                     html.Div(style={'width':'6px'}),
                     dbc.Button("Clear Selection [Esc]", id='clearSelectionButton'),
                     ]),
@@ -1455,6 +1460,7 @@ class HotKeyReminder(Panel):
                     dbc.Tooltip("Generate a QC report (.docx) into the session's save folder.", target='generateReportButton', placement='top'),
                     dbc.Tooltip("Used to disable noisy data or data which cannot be fitted in inversions.", target='disableButton', placement='top'),
                     dbc.Tooltip("Used to enable previously disabled data.", target='enableButton', placement='top'),
+                    dbc.Tooltip("Save the sites as point shapefiles (.shp) for QGIS, one per map colouring: <session>_FromImport, _EnabledDisabled, _Misfit and _DOI.", target='exportShpButton', placement='top'),
                     dbc.Tooltip("Clear the current selection across all panels.", target='clearSelectionButton', placement='top'),
                     dbc.Tooltip("Go to the first collected data site.", target='beginning-buffer', placement='top'),
                     dbc.Tooltip("Go to the previous buffer of sites.", target='prev-buffer', placement='top'),
@@ -1545,6 +1551,8 @@ class HotKeyReminder(Panel):
             Output("buffer-progress", "style"),
             Output("buffer-progress-text", "style"),
             Output('buffer-length-label', 'style'),
+            Output("export-shp-spacer", "style"),
+            Output("exportShpButton", "style"),
 
             Input("interpret_layout", "color"),
             prevent_initial_call=True
@@ -1572,10 +1580,12 @@ class HotKeyReminder(Panel):
                 shown,  # buffer-progress
                 shown,  # buffer-progress-text
                 shown,  # buffer-length-label
+                {"display": "none"},  # export-shp-spacer -- Interpret tab only
+                {"display": "none"},  # exportShpButton -- Interpret tab only
             )
             return (
                 "Delete",
-                "📤 Export",
+                "📤 Export .png/.kmz",
                 {"display": "none"},  # disableButton -- Interpret tab: no longer wired to anything, remove it
                 {"display": "none"},  # disable-enable-spacer
                 hidden,  # beginning-buffer
@@ -1589,6 +1599,8 @@ class HotKeyReminder(Panel):
                 hidden,  # buffer-progress
                 hidden,  # buffer-progress-text
                 hidden,  # buffer-length-label
+                {"width": "6px"},  # export-shp-spacer
+                {},  # exportShpButton -- shown
             )
 
 

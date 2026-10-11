@@ -185,23 +185,41 @@ def _has_basemap(fig):
 # a plain `except Exception` lets it crash the whole report.
 RENDER_ERRORS = (Exception, asyncio.CancelledError)
 
+# Hard limit for one figure render, on top of kaleido's own 90 s per-figure
+# timeout -- covers anything outside that (e.g. its browser not starting),
+# so a report can never stall on one figure.
+RENDER_TIMEOUT_S = 120
 
-def figure_to_png(fig, width, height, scale=1, retries=2):
+
+def _to_png_with_timeout(fig, width, height, scale):
+    import concurrent.futures
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(pio.to_image, fig, format='png', width=width, height=height, scale=scale)
+    try:
+        return future.result(timeout=RENDER_TIMEOUT_S)
+    except concurrent.futures.TimeoutError:
+        raise TimeoutError(f'image render took longer than {RENDER_TIMEOUT_S} s')
+    finally:
+        # Don't wait for a stuck render; its thread is abandoned.
+        pool.shutdown(wait=False)
+
+
+def figure_to_png(fig, width, height, scale=1, retries=1):
     """
     PNG bytes for one figure, robust to basemap download failures.
 
     Map figures fetch their satellite background tiles over the internet
     while kaleido renders them; a single tile that fails or times out makes
-    plotly.js abort the whole image ("Error 525: Map error."). So try a
-    few times, and if it still fails, render without the satellite
-    background rather than not at all.
+    plotly.js abort the whole image ("Error 525: Map error."). So try
+    again, and if it still fails, render without the satellite background
+    rather than not at all.
 
     Returns (png_bytes, basemap_dropped).
     """
     last_error = None
     for _ in range(retries + 1):
         try:
-            return pio.to_image(fig, format='png', width=width, height=height, scale=scale), False
+            return _to_png_with_timeout(fig, width, height, scale), False
         except RENDER_ERRORS as e:
             last_error = e
             print(f'[export] image render failed, retrying: {e}')
@@ -210,8 +228,21 @@ def figure_to_png(fig, width, height, scale=1, retries=2):
         # Direct assignment: update_layout(map_layers=[]) leaves existing layers in place.
         no_basemap.layout.map.layers = []
         print('[export] rendering without the satellite background')
-        return pio.to_image(no_basemap, format='png', width=width, height=height, scale=scale), True
+        return _to_png_with_timeout(no_basemap, width, height, scale), True
     raise last_error
+
+
+def _is_valid_png(path):
+    """True if path exists and is a complete, readable PNG."""
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return False
+    try:
+        from PIL import Image
+        with Image.open(path) as img:
+            img.verify()
+        return True
+    except Exception:
+        return False
 
 
 def _flush_pending_images(pending):
@@ -245,7 +276,12 @@ def _flush_pending_images(pending):
                 )
             except RENDER_ERRORS as e:
                 print(f'[report] batch render failed ({e!r}); rendering this chunk one figure at a time')
-                for p, path in zip(chunk, files):
+                for i, (p, path) in enumerate(zip(chunk, files)):
+                    # Figures the batch finished before it was cancelled are kept.
+                    if _is_valid_png(path):
+                        continue
+                    REPORT_PROGRESS['label'] = (f"Re-rendering figure {start + i + 1}/{total} "
+                                                "(satellite background failed to download)...")
                     png, dropped = figure_to_png(p['fig'], p['width_px'], p['height_px'], p['scale'])
                     basemaps_dropped += dropped
                     with open(path, 'wb') as f:
@@ -595,6 +631,22 @@ def report_options(options=None):
     return merged
 
 
+def _report_copy(panel):
+    """
+    A copy of a live panel that the report can reconfigure freely: its own
+    settings object and attributes, sharing only the (read-only) data.
+    The mean-res grid is dropped so the copy builds its own with the
+    report's radius instead of replacing the live map's.
+    """
+    import copy
+    clone = copy.copy(panel)
+    clone.settings = copy.deepcopy(panel.settings)
+    if hasattr(clone, 'grid'):
+        clone.grid = None
+        clone._grid_key = None
+    return clone
+
+
 def build_report_items(options=None, camera=None):
     """
     Everything the report contains, in order, as a list of dicts:
@@ -605,16 +657,19 @@ def build_report_items(options=None, camera=None):
     Report panel's preview, so the preview is exactly what the report
     will contain.
 
-    Temporarily reassigns the live Map/ModelSection/Model3D panels'
-    settings to render each figure, then restores everything those panels
-    had before this was called -- so building a report never disturbs
-    what's currently on screen. The figures are self-contained go.Figure
-    objects, so they stay valid after the restore.
+    Renders with private copies of the Map/ModelSection/Model3D panels
+    (see _report_copy), never the live ones. It used to switch the live
+    panels' settings temporarily and restore them afterwards, but any
+    other callback redrawing the live map during those seconds picked up
+    the report's temporary state (e.g. the Interpret map suddenly showing
+    enabled/disabled + a mean-res layer after Refresh preview).
 
     camera is the 3D view's scene.camera dict (from model_3d's
     relayoutData), so the report's 3D figure matches what's on screen.
     """
-    from __main__ import sesh, m1, mod2, mod3d
+    from __main__ import sesh
+    from __main__ import m1 as live_m1, mod2 as live_mod2, mod3d as live_mod3d
+    m1, mod2, mod3d = _report_copy(live_m1), _report_copy(live_mod2), _report_copy(live_mod3d)
 
     opts = report_options(options)
     # opts['sections'] is in the user's chosen report order.
@@ -623,19 +678,6 @@ def build_report_items(options=None, camera=None):
     markersize = int(opts['markersize'])
     zoom_offset = float(opts['zoom_offset'])
     grid_buffer_pixel = max(1, int(round(float(opts['mean_res_radius_m']) / m1.grid_pixel_size)))
-
-    orig_m1_settings = dict(
-        plot_by=m1.settings.plot_by, mean_res=m1.settings.mean_res, view=m1.settings.view,
-        markersize=m1.settings.markersize,
-    )
-    orig_m1 = dict(
-        highlighted=m1.highlighted, buffer_sites=m1.buffer_sites, lines=m1.lines,
-        suppress_highlight=m1.suppress_highlight, suppress_disabled_overlay=m1.suppress_disabled_overlay,
-        grid_buffer_pixel=m1.grid_buffer_pixel, grid=getattr(m1, 'grid', None), _grid_key=getattr(m1, '_grid_key', None),
-    )
-    orig_mod2_settings = dict(x_axis=mod2.settings.x_axis, y_axis=mod2.settings.y_axis)
-    orig_mod2 = dict(highlighted=mod2.highlighted, use_buffer=mod2.use_buffer)
-    orig_mod3d = dict(highlighted=mod3d.highlighted, dataframe=mod3d.dataframe)
 
     items = []
 
@@ -648,207 +690,195 @@ def build_report_items(options=None, camera=None):
     def figure(fig, caption, width_px=REPORT_IMG_WIDTH, height_px=REPORT_IMG_HEIGHT):
         items.append(dict(kind='figure', fig=fig, caption=caption, width_px=width_px, height_px=height_px))
 
-    try:
-        heading('QC Report', 0)
+    heading('QC Report', 0)
 
-        overview_df = m1.dataframe
-        if overview_df is not None and 'site_id' in overview_df.columns:
-            overview_df = overview_df[overview_df['site_id'] != -1]
-        n_sites = int(overview_df['site_id'].nunique()) if overview_df is not None else 0
-        has_models = sesh.models is not None and not sesh.models.empty
+    overview_df = m1.dataframe
+    if overview_df is not None and 'site_id' in overview_df.columns:
+        overview_df = overview_df[overview_df['site_id'] != -1]
+    n_sites = int(overview_df['site_id'].nunique()) if overview_df is not None else 0
+    has_models = sesh.models is not None and not sesh.models.empty
 
-        # 'gates_used' is the same site-level enabled/disabled flag Map.py's
-        # disabled-overlay and the Enabled/Disabled figure use (0 = every
-        # gate disabled, i.e. the site itself is disabled) -- summarized in
-        # words here since the overview figure shows every site the same
-        # color ("From Import"), not split by enabled/disabled.
-        if overview_df is not None and 'gates_used' in overview_df.columns and n_sites:
-            n_disabled = int((overview_df['gates_used'] == 0).sum())
-            n_enabled = n_sites - n_disabled
-            enabled_disabled_caption = f" Enabled {n_enabled} out of {n_sites} sites, Disabled {n_disabled} out of {n_sites} sites."
-        else:
-            enabled_disabled_caption = ""
+    # 'gates_used' is the same site-level enabled/disabled flag Map.py's
+    # disabled-overlay and the Enabled/Disabled figure use (0 = every
+    # gate disabled, i.e. the site itself is disabled) -- summarized in
+    # words here since the overview figure shows every site the same
+    # color ("From Import"), not split by enabled/disabled.
+    if overview_df is not None and 'gates_used' in overview_df.columns and n_sites:
+        n_disabled = int((overview_df['gates_used'] == 0).sum())
+        n_enabled = n_sites - n_disabled
+        enabled_disabled_caption = f" Enabled {n_enabled} out of {n_sites} sites, Disabled {n_disabled} out of {n_sites} sites."
+    else:
+        enabled_disabled_caption = ""
 
-        # Common report-figure state: fixed dot size, no leftover selection/
-        # buffer/highlight from the live app, drawn lines and the disabled-
-        # sites overlay both off by default -- each turned back on only for
-        # the specific figures that actually need them.
-        m1.suppress_highlight = True
+    # Common report-figure state: fixed dot size, no leftover selection/
+    # buffer/highlight from the live app, drawn lines and the disabled-
+    # sites overlay both off by default -- each turned back on only for
+    # the specific figures that actually need them.
+    m1.suppress_highlight = True
+    m1.suppress_disabled_overlay = True
+    m1.highlighted = None
+    m1.buffer_sites = None
+    m1.lines = None
+    m1.settings.markersize = markersize
+    m1.settings.mean_res = -1
+
+    # Two fitted views for the same overview bounding box: figures with
+    # no colorbar use the taller plot area (overview_view); figures with
+    # one (misfit/doi and every mean-res band) use the shorter one that
+    # leaves room for it (overview_view_cb) -- see _fit_view/
+    # _add_map_decorations' has_colorbar docstrings for why these can't
+    # just share one view.
+    has_bounds = overview_df is not None and not overview_df.empty
+    overview_view = _fit_view(overview_df['latitude'], overview_df['longitude'], zoom_offset=zoom_offset) if has_bounds else None
+    overview_view_cb = _fit_view(overview_df['latitude'], overview_df['longitude'], has_colorbar=True, zoom_offset=zoom_offset) if has_bounds else None
+
+    # One chapter per section, in the user's chosen order. Each
+    # add_* function adds its heading and figures and returns True, or
+    # returns False without adding anything when its data is missing
+    # (so chapter numbers stay consecutive).
+
+    def add_model_3d(chapter):
+        if not has_models:
+            return False
+        if mod3d.dataframe is None or mod3d.dataframe.empty:
+            mod3d.dataframe = sesh.models.copy()
+        heading(f'{chapter}. 3D Resistivity Model', 1)
+        mod3d.highlighted = None
+        fig3d = mod3d.render()
+        if camera:
+            fig3d.update_layout(scene_camera=camera)
+        figure(fig3d, f"Figure {chapter}-1. 3D resistivity model.",
+               width_px=MODEL_3D_IMG_WIDTH, height_px=MODEL_3D_IMG_HEIGHT)
+        return True
+
+    def add_lines(chapter):
+        # One location map + resistivity profile per drawn line.
+        if sesh.lines is None or sesh.lines.empty or not has_models:
+            print("[report] Line profiles skipped: no drawn lines or no inversion results.")
+            return False
+        print(f"[report] Line profiles: {sesh.lines['line'].nunique()} drawn line(s) found.")
+        heading(f'{chapter}. Resistivity Profiles', 1)
+        mod2.settings.y_axis = 'elevation'
+        mod2.use_buffer = False
+        mod2.highlighted = None
+        # Enabled/disabled status, not the plain "From Import" view.
+        m1.settings.plot_by = 'enabled_disabled'
+        m1.suppress_disabled_overlay = False
+        for line_id in sorted(sesh.lines['line'].unique()):
+            try:
+                line_df = sesh.lines[sesh.lines['line'] == line_id]
+                # Only this one line, not every drawn line -- and only
+                # for these two figures (reset right after).
+                m1.lines = line_df
+                m1.settings.view = _fit_view(line_df['latitude'], line_df['longitude'], zoom_offset=zoom_offset)
+                direction = _direction_label(line_df)
+                map_fig = _render_map(m1)
+                mod2.settings.x_axis = f'line {line_id:.0f}'
+                profile_fig = mod2.render()
+                figure(map_fig, f"Figure {chapter}-{line_id:.0f}a. Location of line {line_id:.0f} ({direction}).")
+                figure(profile_fig, f"Figure {chapter}-{line_id:.0f}b. Resistivity profile for line {line_id:.0f} ({direction}).",
+                       width_px=PROFILE_IMG_WIDTH, height_px=PROFILE_IMG_HEIGHT)
+            except Exception as e:
+                # A line whose _line_N_x/_line_N_y projection columns
+                # aren't on sesh.models yet would otherwise crash
+                # ModelSection.render() and take the whole report down
+                # with it. Skip just this line instead.
+                print(f"[report] Line profiles: skipping line {line_id} due to error: {e}")
+                continue
+            finally:
+                m1.lines = None
         m1.suppress_disabled_overlay = True
-        m1.highlighted = None
-        m1.buffer_sites = None
-        m1.lines = None
-        m1.settings.markersize = markersize
+        return True
+
+    def add_overview(chapter):
+        if not has_bounds:
+            return False
+        heading(f'{chapter}. Study Area Overview', 1)
+        paragraph(f"The survey collected a total of {n_sites} TEM sites.")
+        m1.settings.view = overview_view
+        m1.settings.plot_by = 'none'
+        figure(_render_map(m1), f"Figure {chapter}-1. Overview of surveyed sites.{enabled_disabled_caption}")
+        return True
+
+    def add_enabled_disabled(chapter):
+        if not has_bounds:
+            return False
+        heading(f'{chapter}. Model Locations', 1)
+        m1.settings.view = overview_view
+        m1.suppress_disabled_overlay = False
+        m1.settings.plot_by = 'enabled_disabled'
+        figure(_render_map(m1), f"Figure {chapter}-1. Enabled/disabled data locations.{enabled_disabled_caption}")
+        m1.suppress_disabled_overlay = True
+        return True
+
+    def add_misfit(chapter):
+        if not has_bounds:
+            return False
+        heading(f'{chapter}. Data Residual', 1)
+        m1.settings.view = overview_view_cb
+        m1.settings.plot_by = 'misfit'
+        figure(_render_map(m1), f"Figure {chapter}-1. Data residual (misfit).")
+        return True
+
+    def add_doi(chapter):
+        if not has_bounds:
+            return False
+        heading(f'{chapter}. Depth of Investigation', 1)
+        m1.settings.view = overview_view_cb
+        m1.settings.plot_by = 'doi'
+        figure(_render_map(m1), f"Figure {chapter}-1. Depth of investigation.")
+        return True
+
+    def add_mean_res(chapter):
+        if not (has_models and has_bounds):
+            print("[report] Mean res maps skipped: no inversion results.")
+            return False
+        # Forces a grid rebuild with the report's radius -- _ensure_grid()
+        # only rebuilds when this (or the site count) actually changes.
+        # Done before picking depths, since which bands colour any pixel
+        # depends on the grid (see Map.available_mean_res_depths).
+        m1.grid_buffer_pixel = grid_buffer_pixel
+        m1.grid = None
+        depths = m1.available_mean_res_depths()
+        print(f"[report] Mean res maps: {len(depths)} depth band(s) with data.")
+        if not depths:
+            return False
+        heading(f'{chapter}. Mean Resistivity Depth Maps', 1)
+        # Every band has the mean-res colorbar showing, so this always
+        # uses the colorbar-fitted view.
+        m1.settings.view = overview_view_cb
+        # Enabled/disabled status, so a disabled site's mean-res value
+        # isn't mistaken for a real one.
+        m1.settings.plot_by = 'enabled_disabled'
+        m1.suppress_disabled_overlay = False
+        for fig_no, depth in enumerate(depths, start=1):
+            try:
+                m1.settings.mean_res = depth
+                figure(_render_map(m1), f"Figure {chapter}-{fig_no}. Mean resistivity, {depth}–{depth + 10} m depth.")
+            except Exception as e:
+                print(f"[report] Mean res maps: skipping {depth}-{depth + 10} m band due to error: {e}")
+                continue
+        # Sections after this one must not inherit the mean-res layer.
         m1.settings.mean_res = -1
+        m1.suppress_disabled_overlay = True
+        return True
 
-        # Two fitted views for the same overview bounding box: figures with
-        # no colorbar use the taller plot area (overview_view); figures with
-        # one (misfit/doi and every mean-res band) use the shorter one that
-        # leaves room for it (overview_view_cb) -- see _fit_view/
-        # _add_map_decorations' has_colorbar docstrings for why these can't
-        # just share one view.
-        has_bounds = overview_df is not None and not overview_df.empty
-        overview_view = _fit_view(overview_df['latitude'], overview_df['longitude'], zoom_offset=zoom_offset) if has_bounds else None
-        overview_view_cb = _fit_view(overview_df['latitude'], overview_df['longitude'], has_colorbar=True, zoom_offset=zoom_offset) if has_bounds else None
+    section_builders = {
+        'model_3d': add_model_3d,
+        'lines': add_lines,
+        'overview': add_overview,
+        'enabled_disabled': add_enabled_disabled,
+        'misfit': add_misfit,
+        'doi': add_doi,
+        'mean_res': add_mean_res,
+    }
+    chapter = 1
+    for key in sections:
+        if section_builders[key](chapter):
+            chapter += 1
 
-        # One chapter per section, in the user's chosen order. Each
-        # add_* function adds its heading and figures and returns True, or
-        # returns False without adding anything when its data is missing
-        # (so chapter numbers stay consecutive).
-
-        def add_model_3d(chapter):
-            if not has_models:
-                return False
-            if mod3d.dataframe is None or mod3d.dataframe.empty:
-                mod3d.dataframe = sesh.models.copy()
-            heading(f'{chapter}. 3D Resistivity Model', 1)
-            mod3d.highlighted = None
-            fig3d = mod3d.render()
-            if camera:
-                fig3d.update_layout(scene_camera=camera)
-            figure(fig3d, f"Figure {chapter}-1. 3D resistivity model.",
-                   width_px=MODEL_3D_IMG_WIDTH, height_px=MODEL_3D_IMG_HEIGHT)
-            return True
-
-        def add_lines(chapter):
-            # One location map + resistivity profile per drawn line.
-            if sesh.lines is None or sesh.lines.empty or not has_models:
-                print("[report] Line profiles skipped: no drawn lines or no inversion results.")
-                return False
-            print(f"[report] Line profiles: {sesh.lines['line'].nunique()} drawn line(s) found.")
-            heading(f'{chapter}. Resistivity Profiles', 1)
-            mod2.settings.y_axis = 'elevation'
-            mod2.use_buffer = False
-            mod2.highlighted = None
-            # Enabled/disabled status, not the plain "From Import" view.
-            m1.settings.plot_by = 'enabled_disabled'
-            m1.suppress_disabled_overlay = False
-            for line_id in sorted(sesh.lines['line'].unique()):
-                try:
-                    line_df = sesh.lines[sesh.lines['line'] == line_id]
-                    # Only this one line, not every drawn line -- and only
-                    # for these two figures (reset right after).
-                    m1.lines = line_df
-                    m1.settings.view = _fit_view(line_df['latitude'], line_df['longitude'], zoom_offset=zoom_offset)
-                    direction = _direction_label(line_df)
-                    map_fig = _render_map(m1)
-                    mod2.settings.x_axis = f'line {line_id:.0f}'
-                    profile_fig = mod2.render()
-                    figure(map_fig, f"Figure {chapter}-{line_id:.0f}a. Location of line {line_id:.0f} ({direction}).")
-                    figure(profile_fig, f"Figure {chapter}-{line_id:.0f}b. Resistivity profile for line {line_id:.0f} ({direction}).",
-                           width_px=PROFILE_IMG_WIDTH, height_px=PROFILE_IMG_HEIGHT)
-                except Exception as e:
-                    # A line whose _line_N_x/_line_N_y projection columns
-                    # aren't on sesh.models yet would otherwise crash
-                    # ModelSection.render() and take the whole report down
-                    # with it. Skip just this line instead.
-                    print(f"[report] Line profiles: skipping line {line_id} due to error: {e}")
-                    continue
-                finally:
-                    m1.lines = None
-            m1.suppress_disabled_overlay = True
-            return True
-
-        def add_overview(chapter):
-            if not has_bounds:
-                return False
-            heading(f'{chapter}. Study Area Overview', 1)
-            paragraph(f"The survey collected a total of {n_sites} TEM sites.")
-            m1.settings.view = overview_view
-            m1.settings.plot_by = 'none'
-            figure(_render_map(m1), f"Figure {chapter}-1. Overview of surveyed sites.{enabled_disabled_caption}")
-            return True
-
-        def add_enabled_disabled(chapter):
-            if not has_bounds:
-                return False
-            heading(f'{chapter}. Model Locations', 1)
-            m1.settings.view = overview_view
-            m1.suppress_disabled_overlay = False
-            m1.settings.plot_by = 'enabled_disabled'
-            figure(_render_map(m1), f"Figure {chapter}-1. Enabled/disabled data locations.{enabled_disabled_caption}")
-            m1.suppress_disabled_overlay = True
-            return True
-
-        def add_misfit(chapter):
-            if not has_bounds:
-                return False
-            heading(f'{chapter}. Data Residual', 1)
-            m1.settings.view = overview_view_cb
-            m1.settings.plot_by = 'misfit'
-            figure(_render_map(m1), f"Figure {chapter}-1. Data residual (misfit).")
-            return True
-
-        def add_doi(chapter):
-            if not has_bounds:
-                return False
-            heading(f'{chapter}. Depth of Investigation', 1)
-            m1.settings.view = overview_view_cb
-            m1.settings.plot_by = 'doi'
-            figure(_render_map(m1), f"Figure {chapter}-1. Depth of investigation.")
-            return True
-
-        def add_mean_res(chapter):
-            if not (has_models and has_bounds):
-                print("[report] Mean res maps skipped: no inversion results.")
-                return False
-            # Forces a grid rebuild with the report's radius -- _ensure_grid()
-            # only rebuilds when this (or the site count) actually changes.
-            # Done before picking depths, since which bands colour any pixel
-            # depends on the grid (see Map.available_mean_res_depths).
-            m1.grid_buffer_pixel = grid_buffer_pixel
-            m1.grid = None
-            depths = m1.available_mean_res_depths()
-            print(f"[report] Mean res maps: {len(depths)} depth band(s) with data.")
-            if not depths:
-                return False
-            heading(f'{chapter}. Mean Resistivity Depth Maps', 1)
-            # Every band has the mean-res colorbar showing, so this always
-            # uses the colorbar-fitted view.
-            m1.settings.view = overview_view_cb
-            # Enabled/disabled status, so a disabled site's mean-res value
-            # isn't mistaken for a real one.
-            m1.settings.plot_by = 'enabled_disabled'
-            m1.suppress_disabled_overlay = False
-            for fig_no, depth in enumerate(depths, start=1):
-                try:
-                    m1.settings.mean_res = depth
-                    figure(_render_map(m1), f"Figure {chapter}-{fig_no}. Mean resistivity, {depth}–{depth + 10} m depth.")
-                except Exception as e:
-                    print(f"[report] Mean res maps: skipping {depth}-{depth + 10} m band due to error: {e}")
-                    continue
-            # Sections after this one must not inherit the mean-res layer.
-            m1.settings.mean_res = -1
-            m1.suppress_disabled_overlay = True
-            return True
-
-        section_builders = {
-            'model_3d': add_model_3d,
-            'lines': add_lines,
-            'overview': add_overview,
-            'enabled_disabled': add_enabled_disabled,
-            'misfit': add_misfit,
-            'doi': add_doi,
-            'mean_res': add_mean_res,
-        }
-        chapter = 1
-        for key in sections:
-            if section_builders[key](chapter):
-                chapter += 1
-
-        if not any(item['kind'] == 'figure' for item in items):
-            paragraph("Nothing to show: no report sections are selected, or there is no data for the selected ones yet.")
-    finally:
-        for key, value in orig_m1_settings.items():
-            setattr(m1.settings, key, value)
-        for key, value in orig_m1.items():
-            setattr(m1, key, value)
-        for key, value in orig_mod2_settings.items():
-            setattr(mod2.settings, key, value)
-        for key, value in orig_mod2.items():
-            setattr(mod2, key, value)
-        for key, value in orig_mod3d.items():
-            setattr(mod3d, key, value)
+    if not any(item['kind'] == 'figure' for item in items):
+        paragraph("Nothing to show: no report sections are selected, or there is no data for the selected ones yet.")
 
     return items
 
