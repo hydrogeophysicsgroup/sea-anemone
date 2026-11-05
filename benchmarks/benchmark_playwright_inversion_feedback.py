@@ -1,0 +1,196 @@
+import statistics
+import sys
+from pathlib import Path
+
+from playwright.sync_api import Page, expect
+
+from playwright_selection_support import selection_app_url
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SAMPLE_ARCHIVE = ROOT / "Data" / "L003_S033_2025_1113_125719.zip"
+INVERSION_ROUNDS = 2
+PROGRESS_TIMEOUT_MS = 120_000
+RESULTS_TIMEOUT_MS = 300_000
+
+
+class BrowserLatencyTimer:
+    def __init__(self):
+        self.latencies_ms = []
+        self._next_latency = 0
+        self._waiting_for_target = False
+
+    def set_latency_ms(self, latency_ms: float):
+        self.latencies_ms.append(latency_ms)
+
+    def __call__(self):
+        if not self._waiting_for_target:
+            self._waiting_for_target = True
+            return 0.0
+
+        self._waiting_for_target = False
+        if self._next_latency >= len(self.latencies_ms):
+            raise RuntimeError("The browser latency was not recorded")
+        latency_seconds = self.latencies_ms[self._next_latency] / 1000
+        self._next_latency += 1
+        return latency_seconds
+
+
+def _reset_inversion_session(dash_module):
+    with SAMPLE_ARCHIVE.open("rb") as archive:
+        data, forwards = dash_module.temframe.from_zip_content(archive.read())
+    session = dash_module.session.Session(data=data, forwards=forwards)
+    session.update_site_table()
+
+    dash_module.sesh = session
+    dash_module.m1.dataframe = session.overview
+    dash_module.dbdt1.dataframe = session.data.copy()
+    dash_module.dbdt2.dataframe = session.data.copy()
+    dash_module.rhoa.dataframe = session.data.copy()
+    dash_module.Multi_inv.dataframe = session.data.copy()
+    dash_module.Multi_inv.misfit = None
+    dash_module.Multi_inv.iterations = []
+    dash_module.Multi_inv.title = "Spatially Constrained Inversion"
+    dash_module.Sing_inv.dataframe = session.data.copy()
+
+    main_module = sys.modules["__main__"]
+    main_module.sesh = session
+    main_module.m1 = dash_module.m1
+    return session
+
+
+def _click_to_progress_ms(page: Page):
+    return page.wait_for_function(
+        """() => {
+            const timer = document.getElementById("inv-timer");
+            return timer &&
+                timer.textContent.trim() !== "Elapsed time: 0:00"
+                ? performance.now() - window.__inversionClickAt
+                : false;
+        }""",
+        polling="raf",
+        timeout=PROGRESS_TIMEOUT_MS,
+    ).json_value()
+
+
+def _click_to_results_ms(page: Page):
+    return page.wait_for_function(
+        """() => {
+            const button = document.getElementById("invert_all_button");
+            const graph = document.querySelector("#multi_inv .js-plotly-plot");
+            const title = graph?._fullLayout?.title?.text;
+            const rendered = graph?.querySelector(".main-svg") &&
+                graph.getBoundingClientRect().width > 0;
+            return button && !button.disabled &&
+                title === "Inversion Finished" &&
+                graph.data?.length > 0 && rendered
+                ? performance.now() - window.__inversionClickAt
+                : false;
+        }""",
+        polling="raf",
+        timeout=RESULTS_TIMEOUT_MS,
+    ).json_value()
+
+
+def _benchmark_inversion_latency(
+    page: Page, benchmark, selection_app_url: str, capsys, metric: str
+):
+    dash_module = sys.modules["sea_anemone_benchmark_app"]
+    main_module = sys.modules["__main__"]
+    previous_sesh = main_module.sesh
+    had_main_map = hasattr(main_module, "m1")
+    previous_main_map = getattr(main_module, "m1", None)
+    previous_app_session = dash_module.sesh
+    previous_map_data = dash_module.m1.dataframe
+    multi_inversion_state = {
+        name: (
+            hasattr(dash_module.Multi_inv, name),
+            getattr(dash_module.Multi_inv, name, None),
+        )
+        for name in ("dataframe", "misfit", "iterations", "title", "starting_rho")
+    }
+    timer = BrowserLatencyTimer()
+    benchmark._timer = timer
+
+    def run_inversion():
+        session = _reset_inversion_session(dash_module)
+        response = page.goto(selection_app_url, wait_until="domcontentloaded")
+        assert response is not None and response.status == 200
+        expect(page).to_have_title("Sea Anemone")
+
+        page.locator("#invert_layout").click()
+        invert_button = page.locator("#invert_all_button")
+        invert_button.wait_for(state="visible", timeout=30_000)
+        expect(invert_button).to_be_enabled()
+        expect(page.locator("#inv-timer")).to_have_text("Elapsed time: 0:00")
+
+        page.evaluate(
+            """() => {
+                window.__inversionClickAt = null;
+                document.addEventListener("click", event => {
+                    if (event.target.closest("#invert_all_button")) {
+                        window.__inversionClickAt = performance.now();
+                    }
+                }, true);
+            }"""
+        )
+        invert_button.click()
+
+        progress_ms = _click_to_progress_ms(page)
+        if metric == "progress":
+            timer.set_latency_ms(progress_ms)
+
+        result_ms = _click_to_results_ms(page)
+        assert session.models is not None and not session.models.empty
+        if metric == "results":
+            timer.set_latency_ms(result_ms)
+
+    try:
+        benchmark.pedantic(
+            run_inversion,
+            rounds=INVERSION_ROUNDS,
+            iterations=1,
+            warmup_rounds=0,
+        )
+    finally:
+        main_module.sesh = previous_sesh
+        dash_module.sesh = previous_app_session
+        dash_module.m1.dataframe = previous_map_data
+        for name, (was_present, value) in multi_inversion_state.items():
+            if was_present:
+                setattr(dash_module.Multi_inv, name, value)
+            elif hasattr(dash_module.Multi_inv, name):
+                delattr(dash_module.Multi_inv, name)
+        if had_main_map:
+            main_module.m1 = previous_main_map
+        elif hasattr(main_module, "m1"):
+            del main_module.m1
+
+    median_ms = statistics.median(timer.latencies_ms)
+    maximum_ms = max(timer.latencies_ms)
+    metric_label = (
+        "click-to-first-progress" if metric == "progress" else "click-to-results"
+    )
+    benchmark.extra_info["median latency (ms)"] = round(median_ms, 2)
+    benchmark.extra_info["maximum latency (ms)"] = round(maximum_ms, 2)
+    with capsys.disabled():
+        print(
+            f"{metric_label}: median={median_ms:.2f} ms, "
+            f"maximum={maximum_ms:.2f} ms"
+        )
+
+
+def test_inversion_click_to_first_progress_latency(
+    page: Page, benchmark, selection_app_url: str, capsys
+):
+    _benchmark_inversion_latency(
+        page, benchmark, selection_app_url, capsys, metric="progress"
+    )
+
+
+def test_inversion_click_to_results_latency(
+    page: Page, benchmark, selection_app_url: str, capsys
+):
+    _benchmark_inversion_latency(
+        page, benchmark, selection_app_url, capsys, metric="results"
+    )

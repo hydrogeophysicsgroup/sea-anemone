@@ -163,14 +163,45 @@ python -m pytest benchmarks\benchmark_sea_anemone.py --benchmark-only --benchmar
 
 The suite measures USF archive loading, saved-session restoration, server-side Plotly figure rendering and JSON serialization, single-site inversion, and full inversion using the included 74-site sample archive. It is kept outside `tests/` so the benchmarks do not run as part of the regular CI test suite. Results are machine-dependent; compare runs on the same machine and dataset.
 
-To benchmark the map-selection callback and the visible updates to the sounding, apparent-resistivity, and section plots, run the browser benchmark from the repository root:
+To run the original single-site end-to-end benchmark:
 
 ```cmd
 python -m playwright install chromium
 python -m pytest benchmarks\benchmark_playwright_selection.py --benchmark-only --benchmark-columns=mean,median,stddev
 ```
 
-The benchmark starts an isolated app server with the included sample archive loaded, then simulates map point selection in Chromium. It checks that the sounding and apparent-resistivity plots show only the selected site and that the section plot zooms to that site. The reported median and maximum latency cover selection-event to visible linked-plot updates. Results are machine-dependent, so compare repeated runs on the same machine.
+For a separate comparison of one site against multiple sites, run:
+
+```cmd
+python -m pytest benchmarks\benchmark_playwright_selection_sizes.py --benchmark-only --benchmark-columns=mean,median,stddev
+```
+
+Both files start an isolated app server with the included sample archive loaded and simulate map selections in Chromium. The original benchmark covers a single-site update. The comparison benchmark measures 1, 10, 25, and all available sites, making the one-site case a direct baseline for the multi-site cases. Each case verifies the linked plots and repeats the measurement ten times. Results are machine-dependent, so compare runs on the same machine.
+
+To benchmark loading the archive from the app's initial Upload screen through the map and plots becoming usable, run:
+
+```cmd
+python -m pytest benchmarks\benchmark_playwright_load_data.py --benchmark-only --benchmark-columns=mean,median,stddev
+```
+
+This benchmark selects the included archive through the browser file input using Chromium's ZIP MIME type, switches to Process, verifies that the map contains all expected sites and the sounding, apparent-resistivity, and section plots contain their expected data, and reports median and maximum latency. It repeats the workflow three times; app/page reset is outside the reported browser-visible latency. To benchmark a different ZIP, set `PLAYWRIGHT_UPLOAD_ARCHIVE` to its path before running pytest.
+
+To benchmark switching between Process, Invert, QC, and Interpret and verify the resulting views are interactive, run:
+
+```cmd
+python -m pytest benchmarks\benchmark_playwright_view_switch.py --benchmark-only --benchmark-columns=mean,median,stddev
+```
+
+The test repeats the Invert → QC → Interpret → Process sequence three times. For each switch it waits for the expected plots to be visible and rendered, verifies Plotly has the map in non-static interactive mode, then records click-to-usable-view latency.
+
+To benchmark the real all-sites inversion's first progress update and completed results separately, run:
+
+```cmd
+python -m pytest benchmarks\benchmark_playwright_inversion_feedback.py --benchmark-only --benchmark-columns=mean,median,stddev
+```
+
+This benchmark uses the included sample archive and repeats each measurement twice, resetting the session between runs. Click-to-first-progress measures when the elapsed-time display first changes from `0:00`
+Click-to-results measures when the inversion button is re-enabled and the results plot displays “Inversion Finished.” 
 
 ## Browser Smoke Test
 
