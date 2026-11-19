@@ -379,6 +379,7 @@ class Map(Panel):
                 df_buffer,
                 lat="latitude",
                 lon="longitude",
+                custom_data='site_id',
                 zoom=zoom, center=center, 
             )
             c_layers.append('buffer')
@@ -399,14 +400,20 @@ class Map(Panel):
                 }])
         # selected sites (one clicked, or several selected on the map or in the tTEM section)
         selected = self.buffer.selected if self.buffer is not None else [self.highlighted]
-        if len(selected) and selected[0] is not None:
-            highlight_trace = px.scatter_map(df_plot[df_plot['site_id'].isin(selected)], lat="latitude", lon="longitude", zoom=zoom, center=center, color_discrete_sequence=[self.settings.buffer_color])
+        highlighted_sites = df_plot[df_plot['site_id'].isin(selected)]
+        if not highlighted_sites.empty:
+            highlight_trace = px.scatter_map(highlighted_sites, lat="latitude", lon="longitude",
+                                             custom_data='site_id', zoom=zoom, center=center,
+                                             color_discrete_sequence=[self.settings.buffer_color])
             highlight_trace.update_traces(marker=dict(size=self.settings.markersize*1.2))
-            for trace in highlight_trace.data:
-                fig.add_trace(
-                    trace
-                )
-                c_layers.append('highlight')
+            fig.add_trace(highlight_trace.data[0])
+        else:
+            fig.add_trace(go.Scattermap(
+                lat=[], lon=[], customdata=[], mode='markers', name='highlight',
+                hoverinfo='skip', showlegend=False,
+                marker=dict(size=self.settings.markersize*1.2, color=self.settings.buffer_color)
+            ))
+        c_layers.append('highlight')
 
         if self.lines is not None:
             fig2 = px.line_map(self.lines, lat='latitude', lon='longitude', line_group='line', color='line', zoom=zoom, center=center, color_discrete_sequence=line_colors)

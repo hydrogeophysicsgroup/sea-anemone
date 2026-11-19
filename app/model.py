@@ -34,7 +34,6 @@ class ModelGraph(Panel):
         df_layers_long = df_layers_long.drop(columns=['depth_type'])
 
         if self.highlighted is None:
-            heatmap_df = df_layers_long.set_index('site_id').sort_index(ascending=True)
             buffer_start = self.buffer_start
             buffer_len   = self.buffer_len
 
@@ -46,17 +45,27 @@ class ModelGraph(Panel):
 
             x_slice = x_values[plot_start:plot_end]
 
-            fig = px.line(
-                df_layers_long[df_layers_long['site_id'].isin(x_slice)],
-                x="resistivity",
-                y="depth",
-                color="site_id",
-                labels={
-                    "resistivity": "ρ [Ω·m]",  # Unicode rho
-                    "site_id": "Site ID"
-                },
+            fig = go.Figure(layout=dict(
                 title="1D Resistivity Profile",
-            )
+                legend=dict(title_text="Site ID"),
+            ))
+            plot_data = df_layers_long[df_layers_long['site_id'].isin(x_slice)]
+            colors = px.colors.qualitative.Plotly
+            for color_index, (site_id, site_data) in enumerate(
+                plot_data.groupby('site_id', sort=False)
+            ):
+                fig.add_trace(go.Scatter(
+                    x=site_data["resistivity"],
+                    y=site_data["depth"],
+                    mode="lines",
+                    name=str(site_id),
+                    legendgroup=str(site_id),
+                    line=dict(color=colors[color_index % len(colors)]),
+                    hovertemplate=(
+                        f"Site ID={site_id}<br>ρ [Ω·m]=%{{x}}<br>"
+                        "depth=%{y}<extra></extra>"
+                    ),
+                ))
         else:
             fig = go.Figure(layout=dict(title="1D Resistivity Profile"))
             df_highlighted = df_layers_long[df_layers_long['site_id'] == self.highlighted]
@@ -333,8 +342,10 @@ class ModelSection(Panel):
         if x_axis.startswith('_line'):
             near = sesh.models.loc[np.abs(sesh.models[x_axis.replace('_x', '_y')]) < self.settings.radius] if x_axis in sesh.models.columns else sesh.models.iloc[0:0]
             if len(site_positions(near, x_axis)) == 0:
+                self._site_buffer_site_x = pd.Series(dtype=float)
                 fig = self.message_render(f'No models within {self.settings.radius:g} m of {axis_label(x_axis)}')
                 fig.update_layout(xaxis_title=axis_label(x_axis)+' ▾', yaxis_title=self.settings.y_axis+' ▾', meta={'menus': self.axis_menus()})
+                self._site_buffer_static_shapes = site_buffer_static_shapes(fig)
                 return fig
         fig = self.render_base()
 
@@ -446,6 +457,7 @@ class ModelSection(Panel):
                 )
 
         site_x = site_positions(df, x_axis)
+        self._site_buffer_site_x = site_x
         fig.update_xaxes(range=[x_min, x_max], autorange=False)
         apply_site_buffer(fig, site_x, self.buffer)
         fig.update_yaxes(range=ylim, autorange=False)
@@ -464,6 +476,7 @@ class ModelSection(Panel):
                 layer='above',
             )
         fig.update_layout(meta={**site_lookup(df, x_axis), 'menus': self.axis_menus()})
+        self._site_buffer_static_shapes = site_buffer_static_shapes(fig)
         return fig
         
         # def add_callbacks(self, app):

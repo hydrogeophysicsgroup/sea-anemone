@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 import plotly.io as pio
+import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "app"))
@@ -13,6 +14,7 @@ sys.path.insert(0, str(ROOT / "app"))
 import temframe
 from session import Session
 from panels import dbdtSection, dbdtSounding, rhoaSounding
+from model import ModelGraph
 from map import Map
 from inversion_panels import MultiInversion
 from anemone.inversion import LogResistivity
@@ -52,6 +54,32 @@ def plot_panels(sample_session):
             ].copy()
         ),
     }
+
+
+@pytest.fixture(scope="session")
+def model_graph_panel(sample_session):
+    site_ids = sample_session.site.site_id.dropna().unique().tolist()
+    model_rows = []
+    for site_id in site_ids:
+        model_rows.extend([
+            {
+                "site_id": site_id,
+                "layer": 0,
+                "resistivity": 20.0,
+                "top_depth": 0.0,
+                "bottom_depth": 10.0,
+            },
+            {
+                "site_id": site_id,
+                "layer": 1,
+                "resistivity": 60.0,
+                "top_depth": 10.0,
+                "bottom_depth": 35.0,
+            },
+        ])
+    panel = ModelGraph(dataframe=pd.DataFrame(model_rows))
+    panel.buffer_len = len(site_ids)
+    return panel
 
 
 @pytest.mark.benchmark(group="session loading")
@@ -95,6 +123,46 @@ def test_render_plot(benchmark, plot_panels, panel_name):
         warmup_rounds=0,
     )
     assert figure is not None
+
+
+def test_rhoa_lines_keep_site_boundaries(plot_panels):
+    observed_panel = plot_panels["apparent_resistivity"]
+    synthetic_panel = rhoaSounding(
+        dataframe=observed_panel.dataframe.assign(
+            dbdt_syn=observed_panel.dataframe["dbdt"]
+        )
+    )
+
+    for panel in (observed_panel, synthetic_panel):
+        figure = panel.render()
+        line_traces = [trace for trace in figure.data if trace.mode == "lines"]
+
+        assert len(line_traces) == 2
+        for trace in line_traces:
+            current_site = None
+            for x_value, point_data in zip(trace.x, trace.customdata):
+                site_id = point_data[2]
+                if x_value is None:
+                    assert site_id is None
+                    current_site = None
+                    continue
+                if current_site is None:
+                    current_site = site_id
+                assert site_id == current_site
+
+
+@pytest.mark.benchmark(group="plotting")
+def test_render_model_graph(benchmark, model_graph_panel):
+    figure = benchmark.pedantic(
+        model_graph_panel.render,
+        rounds=3,
+        iterations=1,
+        warmup_rounds=0,
+    )
+    expected_sites = set(model_graph_panel.dataframe["site_id"].unique())
+    assert {trace.name for trace in figure.data} == {
+        str(site_id) for site_id in expected_sites
+    }
 
 
 @pytest.mark.benchmark(group="plot serialization")

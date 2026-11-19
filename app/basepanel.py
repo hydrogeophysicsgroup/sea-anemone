@@ -118,8 +118,13 @@ def apply_site_buffer(fig, site_x, buffer):
     pos = np.flatnonzero(site_x.index.isin(buffer.selected))
     for run in np.split(pos, np.flatnonzero(np.diff(pos) > 1) + 1) if len(pos) else []:
         fig.add_shape(type='rect', xref='x', yref='paper', x0=site_x.iloc[run[0]] - dx, x1=site_x.iloc[run[-1]] + dx,
-                      y0=0, y1=1, line=dict(color='black', width=1.5, dash='dot'), fillcolor='rgba(0,0,0,0)')
+                      y0=0, y1=1, line=dict(color='black', width=1.5, dash='dot'), fillcolor='rgba(0,0,0,0)',
+                      name='site-selection')
     return xrange
+
+
+def site_buffer_static_shapes(fig):
+    return [shape.to_plotly_json() for shape in fig.layout.shapes or () if shape.name != 'site-selection']
 
 
 def axis_menu(target, options, value=None, live=True):

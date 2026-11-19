@@ -26,6 +26,8 @@ class MultiInversion(Panel):
     def __init__(self, dataframe,rho=10., **kwargs):
         self.starting_rho = rho
         self.title = "Spatially Constrained Inversion"
+        self.misfit = None
+        self.iterations = []
         settings = MultiInversionSettings(id='multi_inv', **kwargs)
         super().__init__(id='multi_inv', settings=settings)
         self.dataframe = dataframe
@@ -189,7 +191,6 @@ class MultiInversion(Panel):
 
         elif len(self.misfit) == 0:
             fig = go.Figure()
-            self.title = "Inversion in progress"
             fig.update_layout(title=self.title,xaxis_title='Iterations',yaxis_title='Misfit',xaxis_type='linear',yaxis_type='log',yaxis=dict(range=[-1,2]), 
             xaxis=dict(range=[-0.1,3+len(self.misfit)]),showlegend=True)
             fig.update_xaxes(showline=True, mirror=True)
@@ -282,7 +283,7 @@ class MultiInversion(Panel):
             self.misfit = []
             from __main__ import sesh
 
-            for line in sesh.inv_status:
+            for line in getattr(sesh, "inv_status", ()):
                 if not line.strip():
                     continue  # skip empty lines
 
@@ -331,6 +332,20 @@ class MultiInversion(Panel):
             self.starting_rho = 10
             return self.render_init()
 
+        @app.callback(
+            Output("multi_inv", "figure", allow_duplicate=True),
+            Input("invert_layout", "n_clicks"),
+            State("invert_all_button", "disabled"),
+            prevent_initial_call=True
+        )
+        def reset_stale_progress(_, inversion_running):
+            if inversion_running or self.misfit != []:
+                raise PreventUpdate
+            self.misfit = None
+            self.iterations = []
+            self.title = "Spatially Constrained Inversion"
+            return self.render_init()
+
 
         
         @app.callback(
@@ -338,7 +353,9 @@ class MultiInversion(Panel):
                 Output('interpret_layout', 'disabled', allow_duplicate=True),
                 Output("multi_inv", "figure", allow_duplicate=True),
                 Output("review_layout","color", allow_duplicate=True),
-                Output("map_plot_by",'value', allow_duplicate=True)],
+                Output("map_plot_by",'value', allow_duplicate=True),
+                Output("model_graph", "figure", allow_duplicate=True),
+                Output("model_section", "figure", allow_duplicate=True)],
             Input('invert_all_button', 'n_clicks'),
             State('review_layout', 'n_clicks'),  # Add this state to get current value
             State("vc-level", "data"),
@@ -357,8 +374,11 @@ class MultiInversion(Panel):
             prevent_initial_call=True
         )
         def launch_inversion(n_clicks, current_review_clicks, vc_level,hc_level,starting_model):
-            from __main__ import sesh,m1
+            from __main__ import sesh
             if n_clicks:
+                self.misfit = []
+                self.iterations = []
+                self.title = "Inversion in progress"
                 from torch import from_numpy, tensor
                 print('starting model:', starting_model["rho"])
                 rho = tensor(starting_model["rho"]).repeat(len(starting_model["depth"]))
@@ -383,10 +403,13 @@ class MultiInversion(Panel):
                 res_start                        = LogResistivity.smooth(rho,z) 
                 sesh.models, sesh.data, _ = temframe.invert(sesh.data, sesh.dmfwr, res_start,vc = Vert, hc = Horz)
                 sesh.update_site_table()
-                m1.dataframe = sesh.site.copy()
+                self.map_panel.dataframe = sesh.site.copy()
+                self.model_graph.dataframe = sesh.models.copy()
+                self.model_section.dataframe = sesh.models.copy()
                 self.title = "Inversion Finished"
                 new_review_clicks = (current_review_clicks or 0) + 1
-                return False, False, self.render(), "success","misfit"
+                return (False, False, self.render(), "success", "misfit",
+                        self.model_graph.render(), self.model_section.render())
             raise PreventUpdate
         
         @app.callback(
